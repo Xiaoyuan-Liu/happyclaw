@@ -11,10 +11,12 @@ interface GroupsState {
   error: string | null;
   members: Record<string, GroupMember[]>;
   membersLoading: boolean;
+  runnerStates: Record<string, 'idle' | 'running'>;
   loadGroups: () => Promise<void>;
   loadMembers: (jid: string) => Promise<void>;
   addMember: (jid: string, userId: string) => Promise<void>;
   removeMember: (jid: string, userId: string) => Promise<void>;
+  setRunnerState: (chatJid: string, state: 'idle' | 'running') => void;
 }
 
 export const useGroupsStore = create<GroupsState>((set, get) => ({
@@ -23,6 +25,7 @@ export const useGroupsStore = create<GroupsState>((set, get) => ({
   error: null,
   members: {},
   membersLoading: false,
+  runnerStates: {},
 
   loadGroups: async () => {
     set({ loading: true });
@@ -71,5 +74,15 @@ export const useGroupsStore = create<GroupsState>((set, get) => ({
     // Refresh group lists (both stores) — removed member loses access
     get().loadGroups();
     useChatStore.getState().loadGroups();
+  },
+
+  setRunnerState: (chatJid: string, state: 'idle' | 'running') => {
+    set((s) => {
+      if (state === 'idle') {
+        const { [chatJid]: _, ...rest } = s.runnerStates;
+        return { runnerStates: rest };
+      }
+      return { runnerStates: { ...s.runnerStates, [chatJid]: state } };
+    });
   },
 }));

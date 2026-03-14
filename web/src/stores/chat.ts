@@ -147,7 +147,7 @@ interface ChatState {
   togglePin: (jid: string) => Promise<void>;
   deleteFlow: (jid: string) => Promise<void>;
   handleStreamEvent: (chatJid: string, event: StreamEvent, agentId?: string) => void;
-  handleWsNewMessage: (chatJid: string, wsMsg: any, agentId?: string) => void;
+  handleWsNewMessage: (chatJid: string, wsMsg: any, agentId?: string, source?: string) => void;
   handleAgentStatus: (chatJid: string, agentId: string, status: AgentInfo['status'], name: string, prompt: string, resultSummary?: string, kind?: AgentInfo['kind']) => void;
   clearStreaming: (
     chatJid: string,
@@ -163,6 +163,8 @@ interface ChatState {
   loadAgentMessages: (jid: string, agentId: string, loadMore?: boolean) => Promise<void>;
   sendAgentMessage: (jid: string, agentId: string, content: string) => void;
   refreshAgentMessages: (jid: string, agentId: string) => Promise<void>;
+  // Runner state sync
+  handleRunnerState: (chatJid: string, state: string) => void;
   // IM binding actions
   loadAvailableImGroups: (jid: string) => Promise<AvailableImGroup[]>;
   bindImGroup: (jid: string, agentId: string, imJid: string, force?: boolean) => Promise<boolean>;
@@ -1343,7 +1345,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   // 通过 WebSocket new_message 事件立即添加消息（避免轮询延迟导致消息"丢失"）
-  handleWsNewMessage: (chatJid, wsMsg, agentId?) => {
+  handleWsNewMessage: (chatJid, wsMsg, agentId?, source?) => {
     if (!wsMsg || !wsMsg.id) return;
     // Skip while clearHistory is in-flight to prevent race re-injection
     if (get().clearing[chatJid]) return;
@@ -1389,7 +1391,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const alreadyExists = existing.some((m) => m.id === wsMsg.id);
       const updated = alreadyExists ? existing : [...existing, msg];
 
-      const isAgentReply = msg.is_from_me && msg.sender !== '__system__';
+      const isAgentReply = msg.is_from_me && msg.sender !== '__system__' && source !== 'scheduled_task';
       const isSystemError = isTerminalSystemMessage(msg);
 
       if (isAgentReply || isSystemError) {
@@ -1838,6 +1840,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
       });
     } catch {
       // 静默失败
+    }
+  },
+
+  // Runner 状态同步：idle 时清理残留的 streaming/waiting 状态
+  handleRunnerState: (chatJid, state) => {
+    if (state === 'idle') {
+      get().clearStreaming(chatJid);
     }
   },
 

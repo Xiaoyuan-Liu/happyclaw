@@ -6,6 +6,8 @@ import { ConnectionBanner } from '../common/ConnectionBanner';
 import { wsManager } from '../../api/ws';
 import { useTheme } from '../../hooks/useTheme';
 import { useBillingStore } from '../../stores/billing';
+import { useGroupsStore } from '../../stores/groups';
+import { useChatStore } from '../../stores/chat';
 
 export function AppLayout() {
   const location = useLocation();
@@ -29,6 +31,30 @@ export function AppLayout() {
     const unsub = wsManager.on('billing_update', (data: any) => {
       if (data.usage) {
         useBillingStore.getState().handleBillingUpdate(data.usage);
+      }
+    });
+    return () => { unsub(); };
+  }, []);
+
+  // 监听 runner_state 更新 sidebar 运行状态指示器
+  useEffect(() => {
+    const unsub = wsManager.on('runner_state', (data: any) => {
+      if (data.chatJid && data.state) {
+        useGroupsStore.getState().setRunnerState(data.chatJid, data.state);
+        useChatStore.getState().handleRunnerState(data.chatJid, data.state);
+      }
+    });
+    return () => { unsub(); };
+  }, []);
+
+  // 全局监听 agent_status，确保不在 ChatView 页面时也能更新 sub-agent 状态
+  useEffect(() => {
+    const unsub = wsManager.on('agent_status', (data: any) => {
+      if (data.chatJid && data.agentId) {
+        useChatStore.getState().handleAgentStatus(
+          data.chatJid, data.agentId, data.status,
+          data.name, data.prompt, data.resultSummary, data.kind,
+        );
       }
     });
     return () => { unsub(); };

@@ -593,6 +593,7 @@ scripts/                      # 构建辅助脚本
 - StreamEvent 类型以 `shared/stream-event.ts` 为单一真相源，修改后运行 `make sync-types` 同步（`make build` 自动触发，`make typecheck` 校验一致性）
 - Claude SDK 和 CLI 始终使用最新版本（agent-runner `package.json` 中 `"*"`，通过 `make update-sdk` 更新）
 - 容器内以 `node` 非 root 用户运行，需注意文件权限
+- **关闭服务时禁止 `lsof -ti:PORT | xargs kill`**，该命令会杀掉所有连接到该端口的进程（包括 OrbStack/Docker 网络代理），导致 Docker daemon 崩溃。正确做法：`lsof -ti:PORT -sTCP:LISTEN | xargs kill`（仅杀监听进程）
 
 ## 11. 本地开发
 

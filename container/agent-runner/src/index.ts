@@ -47,6 +47,12 @@ const IPC_INPUT_DIR = path.join(WORKSPACE_IPC, 'input');
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
 
+/**
+ * 流式消息空闲超时：如果 query 期间超过此时间没有收到任何 SDK 消息，
+ * 认为 SDK 已挂起（例如子 Agent 进程崩溃但迭代器未结束），主动中断。
+ */
+const STREAM_IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟
+
 let needsMemoryFlush = false;
 let currentPermissionMode: PermissionMode = 'bypassPermissions';
 
@@ -465,6 +471,8 @@ function shouldClose(): boolean {
   return false;
 }
 
+const IPC_INPUT_DRAIN_SENTINEL = path.join(IPC_INPUT_DIR, '_drain');
+
 const IPC_INPUT_INTERRUPT_SENTINEL = path.join(IPC_INPUT_DIR, '_interrupt');
 const INTERRUPT_GRACE_WINDOW_MS = 10_000;
 let lastInterruptRequestedAt = 0;
@@ -495,6 +503,19 @@ function shouldInterrupt(): boolean {
   if (fs.existsSync(IPC_INPUT_INTERRUPT_SENTINEL)) {
     try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
     markInterruptRequested();
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Check for _drain sentinel (finish current query then exit).
+ * Unlike _close which exits from idle wait, _drain is checked after
+ * a query completes to implement one-question-one-answer semantics.
+ */
+function shouldDrain(): boolean {
+  if (fs.existsSync(IPC_INPUT_DRAIN_SENTINEL)) {
+    try { fs.unlinkSync(IPC_INPUT_DRAIN_SENTINEL); } catch { /* ignore */ }
     return true;
   }
   return false;
@@ -548,6 +569,11 @@ function waitForIpcMessage(): Promise<{ text: string; images?: Array<{ data: str
   return new Promise((resolve) => {
     const poll = () => {
       if (shouldClose()) {
+        resolve(null);
+        return;
+      }
+      if (shouldDrain()) {
+        log('Drain sentinel received, exiting after completed query');
         resolve(null);
         return;
       }
@@ -689,6 +715,8 @@ async function runQuery(
   let ipcPolling = true;
   let closedDuringQuery = false;
   let interruptedDuringQuery = false;
+  // Track last SDK message time for idle timeout detection
+  let lastSdkMessageAt = Date.now();
   // queryRef is set just before the for-await loop so pollIpcDuringQuery can call interrupt()
   let queryRef: { interrupt(): Promise<void>; setPermissionMode(mode: PermissionMode): Promise<void> } | null = null;
   const pollIpcDuringQuery = () => {
@@ -705,6 +733,28 @@ async function runQuery(
       interruptedDuringQuery = true;
       lastInterruptRequestedAt = Date.now();
       queryRef?.interrupt().catch((err: unknown) => log(`Interrupt call failed: ${err}`));
+      stream.end();
+      ipcPolling = false;
+      return;
+    }
+    // _drain: finish current query then exit. Once a result has been received,
+    // the query is logically done but the MessageStream keeps the SDK alive.
+    // Treat drain as close at this point to release the container.
+    if (resultCount > 0 && shouldDrain()) {
+      log('Drain sentinel detected after query result, ending stream');
+      closedDuringQuery = true;
+      stream.end();
+      ipcPolling = false;
+      return;
+    }
+    // 空闲超时检测：如果 SDK 长时间没有发送任何消息（子 Agent 崩溃等），
+    // 主动中断 query 防止进程死等。
+    const idleMs = Date.now() - lastSdkMessageAt;
+    if (idleMs > STREAM_IDLE_TIMEOUT_MS) {
+      log(`Stream idle timeout: no SDK messages for ${Math.round(idleMs / 1000)}s, interrupting query`);
+      emit({ status: 'error', result: null, error: `Stream idle timeout: SDK 超过 ${Math.round(idleMs / 1000)} 秒无响应，已自动中断` });
+      interruptedDuringQuery = true;
+      queryRef?.interrupt().catch((err: unknown) => log(`Idle timeout interrupt failed: ${err}`));
       stream.end();
       ipcPolling = false;
       return;
@@ -892,6 +942,9 @@ async function runQuery(
   });
     queryRef = q;
     for await (const message of q) {
+    // 每收到一条 SDK 消息就重置空闲计时器
+    lastSdkMessageAt = Date.now();
+
     // 流式事件处理
     if (message.type === 'stream_event') {
       processor.processStreamEvent(message as any);
@@ -1114,6 +1167,7 @@ async function main(): Promise<void> {
   // Clean up stale sentinels from previous container runs
   try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
   try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
+  try { fs.unlinkSync(IPC_INPUT_DRAIN_SENTINEL); } catch { /* ignore */ }
 
   // Build initial prompt (drain any pending IPC messages too)
   let prompt = containerInput.prompt;
@@ -1141,8 +1195,9 @@ async function main(): Promise<void> {
   const MAX_OVERFLOW_RETRIES = 3;
   try {
     while (true) {
-      // 清理残留的 _interrupt sentinel，防止空闲期间写入的中断信号影响下一次 query
+      // 清理残留的 sentinel，防止空闲期间写入的信号影响下一次 query
       try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
+      try { fs.unlinkSync(IPC_INPUT_DRAIN_SENTINEL); } catch { /* ignore */ }
       clearInterruptRequested();
 
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
@@ -1326,6 +1381,13 @@ async function main(): Promise<void> {
     });
     process.exit(1);
   }
+
+  // main() 正常结束后必须显式退出。
+  // SDK 内部可能留有未关闭的异步资源（MCP 连接、定时器等），
+  // 如果不调用 process.exit()，Node.js 事件循环不会自动退出，
+  // 导致 agent-runner 进程以 0% CPU 挂起，阻塞队列。
+  log('main() completed, forcing process exit');
+  process.exit(0);
 }
 
 // 处理管道断开（EPIPE）：父进程关闭管道后仍有写入时，静默退出避免 code 1 错误输出
@@ -1378,4 +1440,7 @@ process.on('unhandledRejection', (reason: unknown) => {
   console.error('Unhandled rejection:', reason);
   process.exit(1);
 });
-main();
+main().catch((err) => {
+  console.error('Fatal error in main():', err);
+  process.exit(1);
+});

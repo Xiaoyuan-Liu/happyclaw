@@ -46,6 +46,7 @@ export interface SchedulerDependencies {
   sendMessage: (
     jid: string,
     text: string,
+    options?: { source?: string },
   ) => Promise<string | undefined | void>;
   assistantName: string;
   dailySummaryDeps?: DailySummaryDeps;
@@ -370,7 +371,7 @@ async function runScriptTask(
       ? `[脚本] 执行失败: ${error}${result ? `\n输出:\n${result.slice(0, 500)}` : ''}`
       : `[脚本] ${result!.slice(0, 1000)}`;
 
-    await deps.sendMessage(groupJid, `${deps.assistantName}: ${text}`);
+    await deps.sendMessage(groupJid, `${deps.assistantName}: ${text}`, { source: 'scheduled_task' });
 
     logger.info(
       {

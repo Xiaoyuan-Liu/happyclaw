@@ -1,3 +1,4 @@
+import { useChatStore } from '../../stores/chat';
 import type { AgentInfo } from '../../types';
 
 interface AgentStatusCardProps {
@@ -19,6 +20,8 @@ const STATUS_LABELS: Record<string, string> = {
 
 export function AgentStatusCard({ agent, onClick }: AgentStatusCardProps) {
   const colors = STATUS_COLORS[agent.status] || STATUS_COLORS.running;
+  const streaming = useChatStore((s) => s.agentStreaming[agent.id]);
+  const isRunning = agent.status === 'running';
 
   return (
     <div
@@ -37,7 +40,31 @@ export function AgentStatusCard({ agent, onClick }: AgentStatusCardProps) {
       <p className="mt-1 text-xs text-slate-600 line-clamp-2">
         {agent.prompt}
       </p>
-      {agent.result_summary && agent.status !== 'running' && (
+      {isRunning && streaming && (
+        <div className="mt-1.5 border-t border-current/5 pt-1.5 space-y-1">
+          {streaming.isThinking && (
+            <p className="text-xs text-blue-500 italic">思考中...</p>
+          )}
+          {streaming.activeTools.length > 0 && (
+            <div className="flex flex-wrap gap-1">
+              {streaming.activeTools.map((t) => (
+                <span
+                  key={t.toolUseId}
+                  className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-blue-100 text-blue-700"
+                >
+                  {t.toolName}
+                </span>
+              ))}
+            </div>
+          )}
+          {streaming.partialText && (
+            <p className="text-xs text-slate-500 truncate">
+              {streaming.partialText.slice(0, 100)}
+            </p>
+          )}
+        </div>
+      )}
+      {agent.result_summary && !isRunning && (
         <p className="mt-1.5 text-xs text-slate-500 line-clamp-3 border-t border-current/5 pt-1.5">
           {agent.result_summary}
         </p>

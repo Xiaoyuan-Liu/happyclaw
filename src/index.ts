@@ -78,7 +78,7 @@ import {
 } from './db.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
-import { getChannelType } from './im-channel.js';
+import { getChannelType, extractChatId } from './im-channel.js';
 import {
   registerStreamingSession,
   unregisterStreamingSession,
@@ -163,6 +163,12 @@ let shuttingDown = false;
 const queue = new GroupQueue();
 const EMPTY_CURSOR: MessageCursor = { timestamp: '', id: '' };
 const terminalWarmupInFlight = new Set<string>();
+
+// Per-folder reply route updater: lets sendMessage callers update the
+// reply routing of a running processGroupMessages without killing the process.
+// Key is group folder (one active processGroupMessages per folder).
+type ReplyRouteUpdater = (newSourceJid: string | null) => void;
+const activeRouteUpdaters = new Map<string, ReplyRouteUpdater>();
 
 // Track consecutive IM send failures per JID for auto-unbind
 const imSendFailCounts = new Map<string, number>();
@@ -1095,6 +1101,8 @@ interface SendMessageOptions {
   sendToIM?: boolean;
   /** Pre-computed local image paths to attach to IM messages. Avoids redundant filesystem scans. */
   localImagePaths?: string[];
+  /** Message source identifier (e.g. 'scheduled_task') for frontend routing. */
+  source?: string;
 }
 
 /**
@@ -1421,7 +1429,14 @@ function escapeXml(s: string): string {
 function formatMessages(messages: NewMessage[], isShared = false): string {
   const lines = messages.map((m) => {
     const content = isShared ? `[${m.sender_name}] ${m.content}` : m.content;
-    return `<message sender="${escapeXml(m.sender_name)}" time="${m.timestamp}">${escapeXml(content)}</message>`;
+    const sourceJid = m.source_jid || m.chat_jid;
+    const channelType = getChannelType(sourceJid);
+    let sourceAttr = '';
+    if (channelType) {
+      const chatId = extractChatId(sourceJid);
+      sourceAttr = ` source="${escapeXml(channelType)}:${escapeXml(chatId)}"`;
+    }
+    return `<message sender="${escapeXml(m.sender_name)}"${sourceAttr} time="${m.timestamp}">${escapeXml(content)}</message>`;
   });
   return `<messages>\n${lines.join('\n')}\n</messages>`;
 }
@@ -1572,14 +1587,44 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // ── Feishu Streaming Card ──
   // Create a streaming session for Feishu channels (typing-machine effect).
   // Non-Feishu channels get undefined → all streaming logic is no-op.
-  const streamingSessionJid = replySourceImJid ?? chatJid;
-  const streamingSession =
+  let streamingSessionJid = replySourceImJid ?? chatJid;
+  let streamingSession =
     imManager.createStreamingSession(streamingSessionJid);
   let streamingAccumulatedText = '';
   if (streamingSession) {
     registerStreamingSession(streamingSessionJid, streamingSession);
     logger.debug({ chatJid }, 'Streaming card session created for Feishu');
   }
+
+  // ── Dynamic reply route updater ──
+  // Allows IPC-injected messages (from web.ts / IM polling) to update the
+  // reply routing target without killing the agent process.  This replaces
+  // the old "closeStdin + restart" approach for home groups (#99).
+  activeRouteUpdaters.set(effectiveGroup.folder, (newSourceJid) => {
+    const newImJid =
+      newSourceJid && getChannelType(newSourceJid) ? newSourceJid : null;
+    if (newImJid === replySourceImJid) return; // no change
+    logger.debug(
+      { chatJid, oldRoute: replySourceImJid, newRoute: newImJid },
+      'Reply route updated via IPC injection',
+    );
+    replySourceImJid = newImJid;
+
+    // Rebuild streaming session if the target channel changed
+    const newStreamingJid = replySourceImJid ?? chatJid;
+    if (newStreamingJid !== streamingSessionJid) {
+      if (streamingSession) {
+        if (streamingSession.isActive()) streamingSession.dispose();
+        unregisterStreamingSession(streamingSessionJid);
+      }
+      streamingSessionJid = newStreamingJid;
+      streamingSession = imManager.createStreamingSession(streamingSessionJid);
+      streamingAccumulatedText = '';
+      if (streamingSession) {
+        registerStreamingSession(streamingSessionJid, streamingSession);
+      }
+    }
+  });
 
   const pickRunningTaskForNotification = (): string | null => {
     const runningInQuery = Array.from(queryTaskIds)
@@ -1971,6 +2016,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   await setTyping(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
+  activeRouteUpdaters.delete(effectiveGroup.folder);
 
   // ── Streaming card cleanup ──
   if (streamingSession) {
@@ -2418,9 +2464,15 @@ async function sendMessage(
       content: text,
       timestamp,
       is_from_me: true,
-    });
+    }, undefined, options.source);
     logger.info({ jid, length: text.length, sendToIM }, 'Message sent');
-    broadcastToWebClients(jid, text);
+    // Skip agent_reply broadcast for scheduled tasks to avoid clearing
+    // streaming state of a concurrently running main agent.
+    // Safe because scheduled tasks never trigger typing indicators, so there's
+    // no typing state to clear. The message is still delivered via new_message.
+    if (!options.source) {
+      broadcastToWebClients(jid, text);
+    }
     return msgId;
   } catch (err) {
     logger.error({ jid, err }, 'Failed to send message');
@@ -3604,14 +3656,6 @@ async function startMessageLoop(): Promise<void> {
           }
         }
 
-        // Build set of home folders: IM messages sharing a home folder must
-        // force-restart the container so reply routing is correct (e.g., feishu
-        // messages get feishu replies instead of being silently absorbed by web:main).
-        const homeFolders = new Set<string>();
-        for (const g of Object.values(registeredGroups)) {
-          if (g.is_home) homeFolders.add(g.folder);
-        }
-
         for (const [chatJid, groupMessages] of messagesByGroup) {
           let group = registeredGroups[chatJid];
           if (!group) {
@@ -3626,25 +3670,6 @@ async function startMessageLoop(): Promise<void> {
           // Skip groups with target_agent_id — their messages are routed
           // to conversation agents at IM ingestion time (feishu.ts/telegram.ts)
           if (group.target_agent_id) continue;
-
-          if (group.is_home) homeFolders.add(group.folder);
-
-          // Handle cold-cache/newly-added groups: detect home folders from DB
-          // even if the in-memory map has not been fully refreshed yet.
-          if (!homeFolders.has(group.folder)) {
-            const siblingJids = getJidsByFolder(group.folder);
-            for (const siblingJid of siblingJids) {
-              const sibling =
-                registeredGroups[siblingJid] ?? getRegisteredGroup(siblingJid);
-              if (sibling && !registeredGroups[siblingJid]) {
-                registeredGroups[siblingJid] = sibling;
-              }
-              if (sibling?.is_home) {
-                homeFolders.add(group.folder);
-                break;
-              }
-            }
-          }
 
           // Billing quota check before processing
           if (group.created_by) {
@@ -3703,32 +3728,10 @@ async function startMessageLoop(): Promise<void> {
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
 
-          // Groups sharing a home folder always run as a fresh batch.
-          // This prevents IM messages from being piped into an active web:main
-          // container (whose onOutput callback wouldn't route replies to IM).
-          if (homeFolders.has(group.folder)) {
-            // Only close the active runner's stdin if it is handling user
-            // messages (not a scheduled task).  Sending the _close sentinel to
-            // a running task container prematurely terminates the task, which
-            // causes its reply to be swallowed or delivered to the wrong IM
-            // context.  When the runner is a task, simply enqueue the message
-            // check; GroupQueue will start it once the task finishes.
-            // See GitHub issue riba2534/happyclaw#151.
-            if (!queue.isActiveRunnerTask(chatJid)) {
-              queue.closeStdin(chatJid);
-              logger.debug(
-                { chatJid },
-                'Home-folder message received, forcing stdin close before enqueue',
-              );
-            } else {
-              logger.debug(
-                { chatJid },
-                'Home-folder message received while scheduled task is running; deferring until task completes',
-              );
-            }
-            queue.enqueueMessageCheck(chatJid);
-            continue;
-          }
+          // Home and non-home groups now share the same IPC injection path.
+          // Reply routing is dynamically updated via activeRouteUpdaters when
+          // the message is successfully injected, so we no longer need to kill
+          // the process for home groups.
 
           const shared = !group.is_home && isGroupShared(group.folder);
           const formatted = formatMessages(messagesToSend, shared);
@@ -3738,11 +3741,20 @@ async function startMessageLoop(): Promise<void> {
 
           const lastRawText = messagesToSend[messagesToSend.length - 1].content;
           const intent = analyzeIntent(lastRawText);
+
+          // Determine the IM source JID for route update on successful injection
+          const lastSourceJidForRoute =
+            messagesToSend[messagesToSend.length - 1]?.source_jid || chatJid;
+
           const sendResult = queue.sendMessage(
             chatJid,
             formatted,
             imagesForAgent,
             intent,
+            () => {
+              // IPC write succeeded — update reply route for the running agent
+              activeRouteUpdaters.get(group.folder)?.(lastSourceJidForRoute);
+            },
           );
           if (sendResult === 'sent') {
             logger.debug(
@@ -3777,6 +3789,14 @@ async function startMessageLoop(): Promise<void> {
               id: lastProcessed.id,
             };
             saveState();
+          } else if (sendResult === 'queued') {
+            // Message queued for next container run. Don't advance cursor so
+            // processGroupMessages re-reads it from DB. Drain sentinel will
+            // cause the current container to exit, then drainGroup handles it.
+            logger.debug(
+              { chatJid },
+              'Message queued (drain mode), cursor not advanced',
+            );
           } else {
             // no_active — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
@@ -4765,6 +4785,9 @@ async function main(): Promise<void> {
       imManager.getFeishuChatInfo(userId, chatId),
     clearImFailCounts: (jid: string) => {
       imHealthCheckFailCounts.delete(jid);
+    },
+    updateReplyRoute: (folder: string, sourceJid: string | null) => {
+      activeRouteUpdaters.get(folder)?.(sourceJid);
     },
   });
 

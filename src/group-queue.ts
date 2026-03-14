@@ -10,6 +10,7 @@ import { type MessageIntent } from './intent-analyzer.js';
 
 export type SendMessageResult =
   | 'sent'
+  | 'queued'
   | 'no_active'
   | 'interrupted_stop'
   | 'interrupted_correction';
@@ -37,6 +38,8 @@ interface GroupState {
   retryCount: number;
   retryTimer: ReturnType<typeof setTimeout> | null;
   restarting: boolean;
+  /** True when a _drain sentinel has been written for the current active runner. */
+  drainSentinelWritten: boolean;
 }
 
 type ActiveGroupState = GroupState & { groupFolder: string };
@@ -56,6 +59,9 @@ export class GroupQueue {
     null;
   private onMaxRetriesExceededFn: ((groupJid: string) => void) | null = null;
   private onContainerExitFn: ((groupJid: string) => void) | null = null;
+  private onRunnerStateChangeFn:
+    | ((chatJid: string, state: 'idle' | 'running') => void)
+    | null = null;
   private userConcurrentLimitFn:
     | ((groupJid: string) => { allowed: boolean })
     | null = null;
@@ -76,6 +82,7 @@ export class GroupQueue {
         retryCount: 0,
         retryTimer: null,
         restarting: false,
+        drainSentinelWritten: false,
       };
       this.groups.set(groupJid, state);
     }
@@ -100,6 +107,12 @@ export class GroupQueue {
 
   setOnContainerExit(fn: (groupJid: string) => void): void {
     this.onContainerExitFn = fn;
+  }
+
+  setOnRunnerStateChange(
+    fn: (chatJid: string, state: 'idle' | 'running') => void,
+  ): void {
+    this.onRunnerStateChangeFn = fn;
   }
 
   setUserConcurrentLimitChecker(
@@ -317,6 +330,7 @@ export class GroupQueue {
     text: string,
     images?: Array<{ data: string; mimeType?: string }>,
     intent: MessageIntent = 'continue',
+    onInjected?: () => void,
   ): SendMessageResult {
     const state = this.resolveActiveState(groupJid);
     if (!state) return 'no_active';
@@ -354,6 +368,25 @@ export class GroupQueue {
       // Fall through to write the IPC message so the agent sees the correction after restart
     }
 
+    // For continue intent on main agent (not sub-agent), queue the message
+    // instead of IPC-injecting into the running query. This aligns with
+    // Claude Code's one-question-one-answer model: the current query finishes
+    // first, then drainGroup starts a new container to process queued messages.
+    if (intent === 'continue' && state.agentId === null) {
+      const own = this.getGroup(groupJid);
+      own.pendingMessages = true;
+      this.waitingGroups.add(groupJid);
+      if (!own.drainSentinelWritten) {
+        this.writeDrainSentinel(state);
+        own.drainSentinelWritten = true;
+        logger.info(
+          { groupJid },
+          'Continue intent queued, drain sentinel written',
+        );
+      }
+      return 'queued';
+    }
+
     const inputDir = this.resolveIpcInputDir(state);
     try {
       fs.mkdirSync(inputDir, { recursive: true });
@@ -365,6 +398,7 @@ export class GroupQueue {
         JSON.stringify({ type: 'message', text, images }),
       );
       fs.renameSync(tempPath, filepath);
+      onInjected?.();
       return intent === 'correction' ? 'interrupted_correction' : 'sent';
     } catch {
       return 'no_active';
@@ -382,6 +416,22 @@ export class GroupQueue {
     try {
       fs.mkdirSync(inputDir, { recursive: true });
       fs.writeFileSync(path.join(inputDir, '_close'), '');
+    } catch {
+      // ignore
+    }
+  }
+
+  /**
+   * Signal the active container to finish the current query and then exit.
+   * Unlike _close which exits immediately from waitForIpcMessage, _drain
+   * is only checked after the current query completes, ensuring one-question-
+   * one-answer semantics.
+   */
+  private writeDrainSentinel(state: ActiveGroupState): void {
+    const inputDir = this.resolveIpcInputDir(state);
+    try {
+      fs.mkdirSync(inputDir, { recursive: true });
+      fs.writeFileSync(path.join(inputDir, '_drain'), '');
     } catch {
       // ignore
     }
@@ -694,6 +744,12 @@ export class GroupQueue {
     );
 
     try {
+      this.onRunnerStateChangeFn?.(groupJid, 'running');
+    } catch (err) {
+      logger.error({ groupJid, err }, 'onRunnerStateChange(running) failed');
+    }
+
+    try {
       if (this.processMessagesFn) {
         const success = await this.processMessagesFn(groupJid);
         if (success) {
@@ -707,6 +763,7 @@ export class GroupQueue {
       this.scheduleRetry(groupJid, state);
     } finally {
       state.active = false;
+      state.drainSentinelWritten = false;
       state.process = null;
       state.containerName = null;
       state.displayName = null;
@@ -717,6 +774,11 @@ export class GroupQueue {
         this.activeHostProcessCount--;
       } else {
         this.activeContainerCount--;
+      }
+      try {
+        this.onRunnerStateChangeFn?.(groupJid, 'idle');
+      } catch (err) {
+        logger.error({ groupJid, err }, 'onRunnerStateChange(idle) failed');
       }
       try {
         this.onContainerExitFn?.(groupJid);
@@ -755,12 +817,19 @@ export class GroupQueue {
     );
 
     try {
+      this.onRunnerStateChangeFn?.(groupJid, 'running');
+    } catch (err) {
+      logger.error({ groupJid, err }, 'onRunnerStateChange(running) failed');
+    }
+
+    try {
       await task.fn();
     } catch (err) {
       logger.error({ groupJid, taskId: task.id, err }, 'Error running task');
     } finally {
       state.active = false;
       state.activeRunnerIsTask = false;
+      state.drainSentinelWritten = false;
       state.process = null;
       state.containerName = null;
       state.displayName = null;
@@ -771,6 +840,11 @@ export class GroupQueue {
         this.activeHostProcessCount--;
       } else {
         this.activeContainerCount--;
+      }
+      try {
+        this.onRunnerStateChangeFn?.(groupJid, 'idle');
+      } catch (err) {
+        logger.error({ groupJid, err }, 'onRunnerStateChange(idle) failed');
       }
       try {
         this.onContainerExitFn?.(groupJid);

@@ -47,6 +47,7 @@ import skillsRoutes from './routes/skills.js';
 import browseRoutes from './routes/browse.js';
 import agentRoutes from './routes/agents.js';
 import mcpServersRoutes from './routes/mcp-servers.js';
+import agentDefinitionsRoutes from './routes/agent-definitions.js';
 import { usage as usageRoutes } from './routes/usage.js';
 import billingRoutes from './routes/billing.js';
 import {
@@ -165,6 +166,7 @@ app.route('/api/skills', skillsRoutes);
 app.route('/api/admin', adminRoutes);
 app.route('/api/browse', browseRoutes);
 app.route('/api/mcp-servers', mcpServersRoutes);
+app.route('/api/agent-definitions', agentDefinitionsRoutes);
 app.route('/api/groups', agentRoutes); // Agent routes under /api/groups/:jid/agents
 app.route('/api', monitorRoutes);
 app.route('/api/usage', usageRoutes);
@@ -328,38 +330,38 @@ async function handleWebUserMessage(
     shared,
   );
 
-  // For home chat, always restart the agent so processGroupMessages can
-  // re-evaluate reply routing (replySourceImJid) from the latest message.
-  // IPC-injecting into a running home container is unsafe because:
-  // 1. web:main is shared — runtime owner must be recalculated per sender.
-  // 2. Any home group may have IM bindings — the running agent's reply
-  //    callback was bound to the *previous* message's source_jid, so a
-  //    web message injected into an IM-started runner would incorrectly
-  //    route replies back to IM instead of staying on web (#99).
+  // IPC-inject the message into the running agent process.  For home groups,
+  // the reply route is dynamically updated via activeRouteUpdaters so we no
+  // longer need to kill and restart the process (#99).
   let pipedToActive = false;
-  if (group.is_home) {
-    deps.queue.closeStdin(chatJid);
-    deps.queue.enqueueMessageCheck(chatJid);
+  const images = toAgentImages(normalizedAttachments);
+  const intent = analyzeIntent(content);
+  const updateRoute = deps.updateReplyRoute;
+  const sendResult = deps.queue.sendMessage(
+    chatJid,
+    formatted,
+    images,
+    intent,
+    () => {
+      // IPC write succeeded — update reply route for home groups.
+      // Web messages have no IM source, so clear the IM route.
+      updateRoute?.(group.folder, null);
+    },
+  );
+  if (sendResult === 'sent') {
+    pipedToActive = true;
+  } else if (sendResult === 'interrupted_stop') {
+    // Stop intent: cursor updated, no enqueue needed
+    pipedToActive = true;
+  } else if (sendResult === 'interrupted_correction') {
+    // Correction intent: IPC message written, agent handles it after interrupt
+    pipedToActive = true;
+  } else if (sendResult === 'queued') {
+    // Message queued for next container run; don't advance cursor so
+    // processGroupMessages re-reads it from DB. Drain sentinel already
+    // written — the current runner will exit and drainGroup picks it up.
   } else {
-    const images = toAgentImages(normalizedAttachments);
-    const intent = analyzeIntent(content);
-    const sendResult = deps.queue.sendMessage(
-      chatJid,
-      formatted,
-      images,
-      intent,
-    );
-    if (sendResult === 'sent') {
-      pipedToActive = true;
-    } else if (sendResult === 'interrupted_stop') {
-      // Stop intent: cursor updated, no enqueue needed
-      pipedToActive = true;
-    } else if (sendResult === 'interrupted_correction') {
-      // Correction intent: IPC message written, agent handles it after interrupt
-      pipedToActive = true;
-    } else {
-      deps.queue.enqueueMessageCheck(chatJid);
-    }
+    deps.queue.enqueueMessageCheck(chatJid);
   }
 
   // Only advance per-group cursor when we piped directly into a running container.
@@ -1208,6 +1210,7 @@ export function broadcastNewMessage(
   chatJid: string,
   msg: NewMessage & { is_from_me?: boolean },
   agentId?: string,
+  source?: string,
 ): void {
   // For virtual JIDs like "web:xxx#agent:yyy", extract base JID and agentId
   let baseChatJid = chatJid;
@@ -1224,6 +1227,7 @@ export function broadcastNewMessage(
     chatJid: jid,
     message: { ...msg, is_from_me: msg.is_from_me ?? false },
     ...(effectiveAgentId ? { agentId: effectiveAgentId } : {}),
+    ...(source ? { source } : {}),
   };
   safeBroadcast(wsMsg, isHostGroupJid(baseChatJid), allowedUserIds);
 }
@@ -1287,6 +1291,20 @@ export function broadcastAgentStatus(
     name,
     prompt,
     resultSummary,
+  };
+  safeBroadcast(msg, isHostGroupJid(chatJid), allowedUserIds);
+}
+
+export function broadcastRunnerState(
+  chatJid: string,
+  state: 'idle' | 'running',
+): void {
+  const jid = normalizeHomeJid(chatJid);
+  const allowedUserIds = getGroupAllowedUserIds(chatJid);
+  const msg: WsMessageOut = {
+    type: 'runner_state',
+    chatJid: jid,
+    state,
   };
   safeBroadcast(msg, isHostGroupJid(chatJid), allowedUserIds);
 }
@@ -1366,6 +1384,9 @@ export function startWebServer(webDeps: WebDeps): void {
       }
     }
   });
+
+  // Register runner state change callback for sidebar indicators
+  webDeps.queue.setOnRunnerStateChange(broadcastRunnerState);
 
   // Broadcast status every 5 seconds
   if (statusInterval) clearInterval(statusInterval);

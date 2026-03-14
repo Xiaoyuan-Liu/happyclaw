@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { Plus, PanelLeftClose } from 'lucide-react';
 import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
+import { useGroupsStore } from '../../stores/groups';
 import { Button } from '@/components/ui/button';
 import { SearchInput } from '@/components/common';
 import { ConfirmDialog } from '@/components/common';
@@ -126,6 +127,7 @@ export function ChatSidebar({ className, onToggleCollapse }: ChatSidebarProps) {
 
   const appearance = useAuthStore((s) => s.appearance);
   const appName = appearance?.appName || 'HappyClaw';
+  const runnerStates = useGroupsStore((s) => s.runnerStates);
 
   const handleCreated = (jid: string, folder: string) => {
     selectGroup(jid);
@@ -191,6 +193,7 @@ export function ChatSidebar({ className, onToggleCollapse }: ChatSidebarProps) {
             memberCount={showCollabBadge ? g.member_count : undefined}
             isActive={currentGroup === g.jid}
             isHome={false}
+            isRunning={runnerStates[g.jid] === 'running'}
             editable={g.editable}
             deletable={g.deletable}
             onSelect={handleGroupSelect}
@@ -265,6 +268,7 @@ export function ChatSidebar({ className, onToggleCollapse }: ChatSidebarProps) {
                   executionMode={mainGroup.execution_mode}
                   isActive={currentGroup === mainGroup.jid}
                   isHome
+                  isRunning={runnerStates[mainGroup.jid] === 'running'}
                   editable
                   onSelect={handleGroupSelect}
                   onRename={(jid, name) => setRenameState({ open: true, jid, name })}
@@ -295,6 +299,7 @@ export function ChatSidebar({ className, onToggleCollapse }: ChatSidebarProps) {
                     isActive={currentGroup === g.jid}
                     isHome={false}
                     isPinned
+                    isRunning={runnerStates[g.jid] === 'running'}
                     editable={g.editable}
                     deletable={g.deletable}
                     onSelect={handleGroupSelect}

@@ -111,7 +111,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const resetSession = useChatStore(s => s.resetSession);
   const handleStreamEvent = useChatStore(s => s.handleStreamEvent);
   const handleWsNewMessage = useChatStore(s => s.handleWsNewMessage);
-  const handleAgentStatus = useChatStore(s => s.handleAgentStatus);
+
   const clearStreaming = useChatStore(s => s.clearStreaming);
   const agents = useChatStore(s => s.agents[groupJid] ?? EMPTY_AGENTS);
   const activeAgentTab = useChatStore(s => s.activeAgentTab[groupJid] ?? null);
@@ -257,17 +257,12 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     // 通过 new_message 立即添加消息到本地状态（消除轮询延迟导致的消息"丢失"）
     const unsub3 = wsManager.on('new_message', (data: any) => {
       if (data.chatJid === groupJid && data.message) {
-        handleWsNewMessage(groupJid, data.message, data.agentId);
+        handleWsNewMessage(groupJid, data.message, data.agentId, data.source);
       }
     });
-    // 子 Agent 状态变更
-    const unsub4 = wsManager.on('agent_status', (data: any) => {
-      if (data.chatJid === groupJid) {
-        handleAgentStatus(groupJid, data.agentId, data.status, data.name, data.prompt, data.resultSummary, data.kind);
-      }
-    });
-    return () => { unsub1(); unsub2(); unsub3(); unsub4(); };
-  }, [groupJid, handleStreamEvent, handleWsNewMessage, handleAgentStatus, clearStreaming]);
+    // agent_status 已提升到 AppLayout 全局监听
+    return () => { unsub1(); unsub2(); unsub3(); };
+  }, [groupJid, handleStreamEvent, handleWsNewMessage, clearStreaming]);
 
   const [scrollTrigger, setScrollTrigger] = useState(0);
 

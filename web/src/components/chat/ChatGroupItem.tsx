@@ -20,6 +20,7 @@ export interface ChatGroupItemProps {
   isActive: boolean;
   isHome: boolean;
   isPinned?: boolean;
+  isRunning?: boolean;
   editable?: boolean;
   deletable?: boolean;
   onSelect: (jid: string, folder: string) => void;
@@ -41,6 +42,7 @@ export function ChatGroupItem({
   isActive,
   isHome,
   isPinned,
+  isRunning,
   editable,
   deletable,
   onSelect,
@@ -87,6 +89,12 @@ export function ChatGroupItem({
           >
             {displayName}
           </span>
+          {isRunning && (
+            <span className="relative flex h-2 w-2 flex-shrink-0">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+            </span>
+          )}
           {executionMode === 'host' ? (
             <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-100 text-amber-700">
               宿主机

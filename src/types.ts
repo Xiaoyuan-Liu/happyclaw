@@ -280,6 +280,7 @@ export type WsMessageOut =
       chatJid: string;
       message: NewMessage & { is_from_me: boolean };
       agentId?: string;
+      source?: string;
     }
   | {
       type: 'agent_reply';
@@ -315,15 +316,7 @@ export type WsMessageOut =
   | {
       type: 'runner_state';
       chatJid: string;
-      state:
-        | 'idle'
-        | 'running'
-        | 'interrupting'
-        | 'interrupted'
-        | 'closing'
-        | 'error';
-      agentId?: string;
-      detail?: string;
+      state: 'idle' | 'running';
     }
   | {
       type: 'task_state';
