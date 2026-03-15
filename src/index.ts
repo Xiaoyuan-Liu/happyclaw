@@ -1708,6 +1708,28 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             streamingSession.append(streamingAccumulatedText);
           }
 
+          // ── 中断时立即保存已输出内容 ──
+          // agent-runner 中断后不退出进程（进入 waitForIpcMessage），
+          // finally 块不会执行，必须在此处立即保存。
+          if (
+            result.streamEvent.eventType === 'status' &&
+            result.streamEvent.statusText === 'interrupted' &&
+            streamingAccumulatedText &&
+            !sentReply
+          ) {
+            const interruptedText = streamingAccumulatedText + '\n\n---\n*⚠️ 已中断*';
+            try {
+              if (streamingSession?.isActive()) {
+                await streamingSession.abort('已中断').catch(() => {});
+              }
+              lastReplyMsgId = await sendMessage(chatJid, interruptedText, { sendToIM: false });
+              sentReply = true;
+              commitCursor();
+            } catch (err) {
+              logger.warn({ err, chatJid }, 'Failed to save interrupted text on status event');
+            }
+          }
+
           // Persist SDK Task lifecycle to DB so tabs survive page refresh
           const se = result.streamEvent;
           if (
@@ -2024,16 +2046,34 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (idleTimer) clearTimeout(idleTimer);
     activeRouteUpdaters.delete(effectiveGroup.folder);
 
+    // ── 检测中断：有累积文本但从未发送回复 ──
+    const wasInterrupted = !!streamingAccumulatedText && !sentReply;
+
     // ── Streaming card cleanup ──
     if (streamingSession) {
       if (streamingSession.isActive()) {
         if (hadError || !output || output.status === 'error') {
           await streamingSession.abort('处理出错').catch(() => {});
+        } else if (wasInterrupted) {
+          await streamingSession.abort('已中断').catch(() => {});
         } else {
           streamingSession.dispose();
         }
       }
       unregisterStreamingSession(streamingSessionJid);
+    }
+
+    // ── 保存中断内容到数据库 + 广播到 Web ──
+    if (wasInterrupted) {
+      const interruptedText = streamingAccumulatedText + '\n\n---\n*⚠️ 已中断*';
+      try {
+        // sendToIM: false — 飞书卡片已通过 abort() 展示内容，不重复发送
+        lastReplyMsgId = await sendMessage(chatJid, interruptedText, { sendToIM: false });
+        sentReply = true;
+        commitCursor();
+      } catch (err) {
+        logger.warn({ err, chatJid }, 'Failed to save interrupted text');
+      }
     }
   }
 
@@ -3389,6 +3429,33 @@ async function processAgentConversation(
         agentStreamingSession.append(agentStreamingAccText);
       }
 
+      // ── 中断时立即保存已输出内容 ──
+      if (
+        output.streamEvent.eventType === 'status' &&
+        output.streamEvent.statusText === 'interrupted' &&
+        agentStreamingAccText &&
+        !cursorCommitted
+      ) {
+        const interruptedText = agentStreamingAccText + '\n\n---\n*⚠️ 已中断*';
+        try {
+          if (agentStreamingSession?.isActive()) {
+            await agentStreamingSession.abort('已中断').catch(() => {});
+          }
+          const msgId = crypto.randomUUID();
+          const timestamp = new Date().toISOString();
+          ensureChatExists(virtualChatJid);
+          storeMessageDirect(msgId, virtualChatJid, 'happyclaw-agent', ASSISTANT_NAME, interruptedText, timestamp, true);
+          broadcastNewMessage(virtualChatJid, {
+            id: msgId, chat_jid: virtualChatJid,
+            sender: 'happyclaw-agent', sender_name: ASSISTANT_NAME,
+            content: interruptedText, timestamp, is_from_me: true,
+          }, agentId);
+          commitCursor();
+        } catch (err) {
+          logger.warn({ err, chatJid, agentId }, 'Failed to save interrupted agent text on status event');
+        }
+      }
+
       // Persist token usage for agent conversations
       if (
         output.streamEvent.eventType === 'usage' &&
@@ -3615,17 +3682,40 @@ async function processAgentConversation(
   } finally {
     if (idleTimer) clearTimeout(idleTimer);
 
+    const wasInterrupted = !!agentStreamingAccText && !cursorCommitted;
+
     // ── Streaming card cleanup ──
     if (agentStreamingSession) {
       if (agentStreamingSession.isActive()) {
         if (hadError) {
           await agentStreamingSession.abort('处理出错').catch(() => {});
+        } else if (wasInterrupted) {
+          await agentStreamingSession.abort('已中断').catch(() => {});
         } else {
           agentStreamingSession.dispose();
         }
       }
       if (streamingSessionJid) {
         unregisterStreamingSession(streamingSessionJid);
+      }
+    }
+
+    // ── 保存中断内容 ──
+    if (wasInterrupted) {
+      const interruptedText = agentStreamingAccText + '\n\n---\n*⚠️ 已中断*';
+      try {
+        const msgId = crypto.randomUUID();
+        const timestamp = new Date().toISOString();
+        ensureChatExists(virtualChatJid);
+        storeMessageDirect(msgId, virtualChatJid, 'happyclaw-agent', ASSISTANT_NAME, interruptedText, timestamp, true);
+        broadcastNewMessage(virtualChatJid, {
+          id: msgId, chat_jid: virtualChatJid,
+          sender: 'happyclaw-agent', sender_name: ASSISTANT_NAME,
+          content: interruptedText, timestamp, is_from_me: true,
+        }, agentId);
+        commitCursor();
+      } catch (err) {
+        logger.warn({ err, chatJid, agentId }, 'Failed to save interrupted agent text');
       }
     }
   }

@@ -74,6 +74,7 @@ import path from 'node:path';
 import net from 'node:net';
 import { z } from 'zod';
 import { broadcastNewMessage, invalidateAllowedUserCache } from '../web.js';
+import { getStreamingSession } from '../feishu-streaming-card.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -925,6 +926,12 @@ groupRoutes.post('/:jid/interrupt', authMiddleware, async (c) => {
 
   const interrupted = deps.queue.interruptQuery(jid);
   if (interrupted) {
+    // ── 立即 abort 飞书流式卡片 ──
+    const session = getStreamingSession(jid);
+    if (session?.isActive()) {
+      session.abort('已中断').catch(() => {});
+    }
+
     // Persist interrupt as a system marker so refresh/state-restore can
     // deterministically clear waiting even when no assistant reply exists.
     const messageId = crypto.randomUUID();

@@ -717,6 +717,11 @@ async function runQuery(
   let interruptedDuringQuery = false;
   // Track last SDK message time for idle timeout detection
   let lastSdkMessageAt = Date.now();
+  // After a result is received, allow a short window for the host to write _drain
+  // before force-closing the stream. This preserves the drain model while avoiding
+  // the full STREAM_IDLE_TIMEOUT_MS (5 min) wait.
+  let resultReceivedAt: number | null = null;
+  const POST_RESULT_TIMEOUT_MS = 5_000;
   // queryRef is set just before the for-await loop so pollIpcDuringQuery can call interrupt()
   let queryRef: { interrupt(): Promise<void>; setPermissionMode(mode: PermissionMode): Promise<void> } | null = null;
   const pollIpcDuringQuery = () => {
@@ -742,6 +747,15 @@ async function runQuery(
     // Treat drain as close at this point to release the container.
     if (resultCount > 0 && shouldDrain()) {
       log('Drain sentinel detected after query result, ending stream');
+      closedDuringQuery = true;
+      stream.end();
+      ipcPolling = false;
+      return;
+    }
+    // ── 结果后超时：result 已收到，给 host 短暂时间写 _drain ──
+    // 避免等待完整的 STREAM_IDLE_TIMEOUT_MS（5 分钟）。
+    if (resultReceivedAt && Date.now() - resultReceivedAt > POST_RESULT_TIMEOUT_MS) {
+      log(`Post-result timeout (${POST_RESULT_TIMEOUT_MS / 1000}s), closing stream`);
       closedDuringQuery = true;
       stream.end();
       ipcPolling = false;
@@ -1066,6 +1080,11 @@ async function runQuery(
         });
         log(`Usage: input=${sdkUsage.input_tokens} output=${sdkUsage.output_tokens} cost=$${resultMsg.total_cost_usd} turns=${resultMsg.num_turns}`);
       }
+
+      // ── 标记结果已收到 ──
+      // pollIpcDuringQuery 会在 POST_RESULT_TIMEOUT_MS 后关闭 stream，
+      // 期间仍可检测 _drain/_close/_interrupt sentinel。
+      resultReceivedAt = Date.now();
     }
   }
 
