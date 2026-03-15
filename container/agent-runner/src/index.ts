@@ -508,6 +508,21 @@ function shouldInterrupt(): boolean {
   return false;
 }
 
+function cleanupStartupInterruptSentinel(): void {
+  try {
+    const stat = fs.statSync(IPC_INPUT_INTERRUPT_SENTINEL);
+    const ageMs = Date.now() - stat.mtimeMs;
+    if (ageMs <= INTERRUPT_GRACE_WINDOW_MS) {
+      log(`Preserving recent interrupt sentinel at startup (${Math.round(ageMs)}ms old)`);
+      return;
+    }
+    fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL);
+    log(`Removed stale interrupt sentinel at startup (${Math.round(ageMs)}ms old)`);
+  } catch {
+    /* ignore */
+  }
+}
+
 /**
  * Check for _drain sentinel (finish current query then exit).
  * Unlike _close which exits from idle wait, _drain is checked after
@@ -715,6 +730,8 @@ async function runQuery(
   let ipcPolling = true;
   let closedDuringQuery = false;
   let interruptedDuringQuery = false;
+  let suppressOutputAfterInterrupt = false;
+  let visibleOutputStarted = false;
   // Track last SDK message time for idle timeout detection
   let lastSdkMessageAt = Date.now();
   // After a result is received, allow a short window for the host to write _drain
@@ -736,6 +753,10 @@ async function runQuery(
     if (shouldInterrupt()) {
       log('Interrupt sentinel detected, interrupting current query');
       interruptedDuringQuery = true;
+      if (!visibleOutputStarted && resultCount === 0) {
+        suppressOutputAfterInterrupt = true;
+        log('Interrupt arrived before visible output, suppressing query output');
+      }
       lastInterruptRequestedAt = Date.now();
       queryRef?.interrupt().catch((err: unknown) => log(`Interrupt call failed: ${err}`));
       stream.end();
@@ -929,6 +950,15 @@ async function runQuery(
     ? [WORKSPACE_GLOBAL, WORKSPACE_MEMORY]
     : [WORKSPACE_MEMORY];
 
+  if (shouldInterrupt()) {
+    log('Interrupt sentinel detected before query start, skipping query');
+    interruptedDuringQuery = true;
+    suppressOutputAfterInterrupt = true;
+    ipcPolling = false;
+    stream.end();
+    return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery };
+  }
+
   try {
     const q = query({
     prompt: stream,
@@ -957,22 +987,50 @@ async function runQuery(
     }
   });
     queryRef = q;
+    if (shouldInterrupt()) {
+      log('Interrupt sentinel already present when query started, interrupting immediately');
+      interruptedDuringQuery = true;
+      if (!visibleOutputStarted && resultCount === 0) {
+        suppressOutputAfterInterrupt = true;
+      }
+      queryRef.interrupt().catch((err: unknown) => log(`Immediate interrupt call failed: ${err}`));
+      stream.end();
+      ipcPolling = false;
+    }
     for await (const message of q) {
     // 每收到一条 SDK 消息就重置空闲计时器
     lastSdkMessageAt = Date.now();
 
     // 流式事件处理
     if (message.type === 'stream_event') {
+      if (!suppressOutputAfterInterrupt) {
+        visibleOutputStarted = true;
+      }
+      if (suppressOutputAfterInterrupt) {
+        continue;
+      }
       processor.processStreamEvent(message as any);
       continue;
     }
 
     if (message.type === 'tool_progress') {
+      if (!suppressOutputAfterInterrupt) {
+        visibleOutputStarted = true;
+      }
+      if (suppressOutputAfterInterrupt) {
+        continue;
+      }
       processor.processToolProgress(message as any);
       continue;
     }
 
     if (message.type === 'tool_use_summary') {
+      if (!suppressOutputAfterInterrupt) {
+        visibleOutputStarted = true;
+      }
+      if (suppressOutputAfterInterrupt) {
+        continue;
+      }
       processor.processToolUseSummary(message as any);
       continue;
     }
@@ -997,6 +1055,18 @@ async function runQuery(
       log(`[msg #${messageCount}] type=${msgType} parent_tool_use_id=${rawParent === undefined ? 'UNDEFINED' : rawParent === null ? 'NULL' : rawParent} content_types=[${contentTypes}] keys=[${Object.keys(message).join(',')}]`);
     } else {
       log(`[msg #${messageCount}] type=${msgType}${msgParentToolUseId ? ` parent=${msgParentToolUseId.slice(0, 12)}` : ''}`);
+    }
+
+    if (message.type !== 'system') {
+      visibleOutputStarted = true;
+    }
+    if (suppressOutputAfterInterrupt && message.type !== 'system') {
+      if (message.type === 'result') {
+        resultCount++;
+        resultReceivedAt = Date.now();
+      }
+      log(`[msg #${messageCount}] suppressed after early interrupt`);
+      continue;
     }
 
     // ── 子 Agent 消息转 StreamEvent ──
@@ -1187,7 +1257,7 @@ async function main(): Promise<void> {
 
   // Clean up stale sentinels from previous container runs
   try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
-  try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
+  cleanupStartupInterruptSentinel();
   try { fs.unlinkSync(IPC_INPUT_DRAIN_SENTINEL); } catch { /* ignore */ }
 
   // Build initial prompt (drain any pending IPC messages too)

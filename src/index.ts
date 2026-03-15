@@ -165,6 +165,9 @@ let shuttingDown = false;
 const queue = new GroupQueue();
 const EMPTY_CURSOR: MessageCursor = { timestamp: '', id: '' };
 const terminalWarmupInFlight = new Set<string>();
+const STUCK_RUNNER_CHECK_INTERVAL_POLLS = 15;
+const STUCK_RUNNER_IDLE_MS = 6 * 60 * 1000;
+let stuckRunnerCheckCounter = 0;
 
 // Per-folder reply route updater: lets sendMessage callers update the
 // reply routing of a running processGroupMessages without killing the process.
@@ -1595,6 +1598,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let streamingSession =
     imManager.createStreamingSession(streamingSessionJid, makeOnCardCreated(streamingSessionJid));
   let streamingAccumulatedText = '';
+  let streamInterrupted = false;
   if (streamingSession) {
     registerStreamingSession(streamingSessionJid, streamingSession);
     logger.debug({ chatJid }, 'Streaming card session created for Feishu');
@@ -1712,20 +1716,21 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           // finally 块不会执行，必须在此处立即保存。
           if (
             result.streamEvent.eventType === 'status' &&
-            result.streamEvent.statusText === 'interrupted' &&
-            streamingAccumulatedText &&
-            !sentReply
+            result.streamEvent.statusText === 'interrupted'
           ) {
-            const interruptedText = streamingAccumulatedText + '\n\n---\n*⚠️ 已中断*';
-            try {
-              if (streamingSession?.isActive()) {
-                await streamingSession.abort('已中断').catch(() => {});
+            streamInterrupted = true;
+            if (!sentReply) {
+              const interruptedText = buildInterruptedReply(streamingAccumulatedText);
+              try {
+                if (streamingSession?.isActive()) {
+                  await streamingSession.abort('已中断').catch(() => {});
+                }
+                lastReplyMsgId = await sendMessage(chatJid, interruptedText, { sendToIM: false });
+                sentReply = true;
+                commitCursor();
+              } catch (err) {
+                logger.warn({ err, chatJid }, 'Failed to save interrupted text on status event');
               }
-              lastReplyMsgId = await sendMessage(chatJid, interruptedText, { sendToIM: false });
-              sentReply = true;
-              commitCursor();
-            } catch (err) {
-              logger.warn({ err, chatJid }, 'Failed to save interrupted text on status event');
             }
           }
 
@@ -2046,7 +2051,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     activeRouteUpdaters.delete(effectiveGroup.folder);
 
     // ── 检测中断：有累积文本但从未发送回复 ──
-    const wasInterrupted = !!streamingAccumulatedText && !sentReply;
+    const wasInterrupted = streamInterrupted && !sentReply;
 
     // ── Streaming card cleanup ──
     if (streamingSession) {
@@ -2064,7 +2069,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
     // ── 保存中断内容到数据库 + 广播到 Web ──
     if (wasInterrupted) {
-      const interruptedText = streamingAccumulatedText + '\n\n---\n*⚠️ 已中断*';
+      const interruptedText = buildInterruptedReply(streamingAccumulatedText);
       try {
         // sendToIM: false — 飞书卡片已通过 abort() 展示内容，不重复发送
         lastReplyMsgId = await sendMessage(chatJid, interruptedText, { sendToIM: false });
@@ -2369,6 +2374,15 @@ async function runAgent(
   // Wrap onOutput to track session ID from streamed results
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
+        queue.markRunnerActivity(chatJid);
+        if (
+          (output.status === 'success' && output.result !== null) ||
+          (output.status === 'stream' &&
+            output.streamEvent?.eventType === 'status' &&
+            output.streamEvent.statusText === 'interrupted')
+        ) {
+          queue.markRunnerQueryIdle(chatJid);
+        }
         // 仅从成功的输出中更新 session ID；
         // error 输出可能携带 stale ID，会覆盖流式传递的有效 session
         if (output.newSessionId && output.status !== 'error') {
@@ -2525,6 +2539,11 @@ async function sendMessage(
     logger.error({ jid, err }, 'Failed to send message');
     return undefined;
   }
+}
+
+function buildInterruptedReply(partialText: string): string {
+  const trimmed = partialText.trimEnd();
+  return trimmed ? `${trimmed}\n\n---\n*⚠️ 已中断*` : '*⚠️ 已中断*';
 }
 
 /**
@@ -3369,6 +3388,7 @@ async function processAgentConversation(
       )
     : undefined;
   let agentStreamingAccText = '';
+  let agentStreamInterrupted = false;
   if (agentStreamingSession && streamingSessionJid) {
     registerStreamingSession(streamingSessionJid, agentStreamingSession);
     logger.debug(
@@ -3431,27 +3451,28 @@ async function processAgentConversation(
       // ── 中断时立即保存已输出内容 ──
       if (
         output.streamEvent.eventType === 'status' &&
-        output.streamEvent.statusText === 'interrupted' &&
-        agentStreamingAccText &&
-        !cursorCommitted
+        output.streamEvent.statusText === 'interrupted'
       ) {
-        const interruptedText = agentStreamingAccText + '\n\n---\n*⚠️ 已中断*';
-        try {
-          if (agentStreamingSession?.isActive()) {
-            await agentStreamingSession.abort('已中断').catch(() => {});
+        agentStreamInterrupted = true;
+        if (!cursorCommitted) {
+          const interruptedText = buildInterruptedReply(agentStreamingAccText);
+          try {
+            if (agentStreamingSession?.isActive()) {
+              await agentStreamingSession.abort('已中断').catch(() => {});
+            }
+            const msgId = crypto.randomUUID();
+            const timestamp = new Date().toISOString();
+            ensureChatExists(virtualChatJid);
+            storeMessageDirect(msgId, virtualChatJid, 'happyclaw-agent', ASSISTANT_NAME, interruptedText, timestamp, true);
+            broadcastNewMessage(virtualChatJid, {
+              id: msgId, chat_jid: virtualChatJid,
+              sender: 'happyclaw-agent', sender_name: ASSISTANT_NAME,
+              content: interruptedText, timestamp, is_from_me: true,
+            }, agentId);
+            commitCursor();
+          } catch (err) {
+            logger.warn({ err, chatJid, agentId }, 'Failed to save interrupted agent text on status event');
           }
-          const msgId = crypto.randomUUID();
-          const timestamp = new Date().toISOString();
-          ensureChatExists(virtualChatJid);
-          storeMessageDirect(msgId, virtualChatJid, 'happyclaw-agent', ASSISTANT_NAME, interruptedText, timestamp, true);
-          broadcastNewMessage(virtualChatJid, {
-            id: msgId, chat_jid: virtualChatJid,
-            sender: 'happyclaw-agent', sender_name: ASSISTANT_NAME,
-            content: interruptedText, timestamp, is_from_me: true,
-          }, agentId);
-          commitCursor();
-        } catch (err) {
-          logger.warn({ err, chatJid, agentId }, 'Failed to save interrupted agent text on status event');
         }
       }
 
@@ -3681,7 +3702,7 @@ async function processAgentConversation(
   } finally {
     if (idleTimer) clearTimeout(idleTimer);
 
-    const wasInterrupted = !!agentStreamingAccText && !cursorCommitted;
+    const wasInterrupted = agentStreamInterrupted && !cursorCommitted;
 
     // ── Streaming card cleanup ──
     if (agentStreamingSession) {
@@ -3701,7 +3722,7 @@ async function processAgentConversation(
 
     // ── 保存中断内容 ──
     if (wasInterrupted) {
-      const interruptedText = agentStreamingAccText + '\n\n---\n*⚠️ 已中断*';
+      const interruptedText = buildInterruptedReply(agentStreamingAccText);
       try {
         const msgId = crypto.randomUUID();
         const timestamp = new Date().toISOString();
@@ -3906,7 +3927,30 @@ async function startMessageLoop(): Promise<void> {
     } catch (err) {
       logger.error({ err }, 'Error in message loop');
     }
+
+    stuckRunnerCheckCounter++;
+    if (stuckRunnerCheckCounter >= STUCK_RUNNER_CHECK_INTERVAL_POLLS) {
+      stuckRunnerCheckCounter = 0;
+      recoverStuckPendingGroups();
+    }
+
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
+  }
+}
+
+function recoverStuckPendingGroups(): void {
+  const stuckGroups = queue.getStuckPendingGroups(STUCK_RUNNER_IDLE_MS);
+  for (const { jid, idleMs } of stuckGroups) {
+    logger.warn(
+      { chatJid: jid, idleMs },
+      'Runner has pending messages but no activity; restarting',
+    );
+    queue.restartGroup(jid).catch((err) => {
+      logger.error(
+        { chatJid: jid, err },
+        'Failed to restart stuck runner with pending messages',
+      );
+    });
   }
 }
 

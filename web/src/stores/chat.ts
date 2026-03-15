@@ -246,6 +246,10 @@ function isTerminalSystemMessage(message: Pick<Message, 'sender' | 'content'>): 
   );
 }
 
+function isInterruptSystemMessage(message: Pick<Message, 'sender' | 'content'>): boolean {
+  return message.sender === '__system__' && message.content === 'query_interrupted';
+}
+
 function clearSdkTaskCleanupTimer(taskId: string): void {
   const timer = sdkTaskCleanupTimers.get(taskId);
   if (timer) {
@@ -644,6 +648,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
             (m) => m.is_from_me && m.sender !== '__system__',
           );
           const hasSystemError = data.messages.some((m) => isTerminalSystemMessage(m));
+          const hasInterruptMarker = data.messages.some((m) => isInterruptSystemMessage(m));
+          const shouldFinalizeInterrupt = hasInterruptMarker && !s.streaming[jid]?.interrupted;
 
           // Transfer pending thinking to thinkingCache
           let nextThinkingCache = s.thinkingCache;
@@ -661,10 +667,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
           return {
             messages: { ...s.messages, [jid]: merged },
-            waiting: (agentReplied || hasSystemError)
+            waiting: (agentReplied || hasSystemError || shouldFinalizeInterrupt)
               ? { ...s.waiting, [jid]: false }
               : s.waiting,
-            streaming: (agentReplied || hasSystemError)
+            streaming: (agentReplied || hasSystemError || shouldFinalizeInterrupt)
               ? (() => { const next = { ...s.streaming }; delete next[jid]; return next; })()
               : s.streaming,
             thinkingCache: nextThinkingCache,
@@ -1422,8 +1428,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
       const isAgentReply = msg.is_from_me && msg.sender !== '__system__' && source !== 'scheduled_task';
       const isSystemError = isTerminalSystemMessage(msg);
+      const isInterruptMarker = isInterruptSystemMessage(msg);
+      const shouldFinalizeInterrupt = isInterruptMarker && !s.streaming[chatJid]?.interrupted;
 
-      if (isAgentReply || isSystemError) {
+      if (isAgentReply || isSystemError || shouldFinalizeInterrupt) {
         // Agent 回复或系统错误：立即清除流式状态和等待标志，转移 thinking 缓存
         const streamState = s.streaming[chatJid];
         const thinkingText = isAgentReply

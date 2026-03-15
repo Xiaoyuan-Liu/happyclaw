@@ -29,6 +29,10 @@ interface GroupState {
   active: boolean;
   /** True when the active runner is executing a scheduled task (not user messages). */
   activeRunnerIsTask: boolean;
+  /** Last time this runner produced any observable output. */
+  lastActivityAt: number | null;
+  /** True while the runner is inside an active query turn. */
+  queryInFlight: boolean;
   pendingMessages: boolean;
   pendingTasks: QueuedTask[];
   process: ChildProcess | null;
@@ -73,6 +77,8 @@ export class GroupQueue {
       state = {
         active: false,
         activeRunnerIsTask: false,
+        lastActivityAt: null,
+        queryInFlight: false,
         pendingMessages: false,
         pendingTasks: [],
         process: null,
@@ -186,6 +192,38 @@ export class GroupQueue {
     return shared as ActiveGroupState;
   }
 
+  /**
+   * Write a single _drain sentinel to the actual active main-agent runner that
+   * owns this serialization key. This must target the runner state rather than
+   * the caller's group state because sibling JIDs can share one process.
+   */
+  private requestDrainForActiveRunner(
+    groupJid: string,
+    reason: string,
+  ): boolean {
+    const activeRunner = this.findActiveRunnerFor(groupJid);
+    if (!activeRunner) return false;
+
+    const runnerState = this.getGroup(activeRunner);
+    if (
+      !runnerState.active ||
+      !runnerState.groupFolder ||
+      runnerState.agentId !== null
+    ) {
+      return false;
+    }
+
+    if (runnerState.drainSentinelWritten) {
+      return true;
+    }
+
+    const wrote = this.writeDrainSentinel(runnerState as ActiveGroupState);
+    if (!wrote) return false;
+    runnerState.drainSentinelWritten = true;
+    logger.info({ groupJid, activeRunner }, reason);
+    return true;
+  }
+
   /** 检查指定 JID 是否有自己直接启动的活跃 runner（非通过 folder 共享匹配） */
   hasDirectActiveRunner(groupJid: string): boolean {
     const state = this.groups.get(groupJid);
@@ -202,6 +240,38 @@ export class GroupQueue {
     return state?.activeRunnerIsTask === true;
   }
 
+  markRunnerActivity(groupJid: string): void {
+    const state = this.resolveActiveState(groupJid);
+    if (!state?.active) return;
+    state.lastActivityAt = Date.now();
+  }
+
+  markRunnerQueryIdle(groupJid: string): void {
+    const state = this.resolveActiveState(groupJid);
+    if (!state?.active) return;
+    state.queryInFlight = false;
+  }
+
+  getStuckPendingGroups(
+    idleThresholdMs: number,
+  ): Array<{ jid: string; idleMs: number }> {
+    const now = Date.now();
+    const stuck: Array<{ jid: string; idleMs: number }> = [];
+    for (const [jid, state] of this.groups.entries()) {
+      if (!state.active) continue;
+      if (state.activeRunnerIsTask) continue;
+      if (!state.pendingMessages) continue;
+      if (state.agentId !== null) continue;
+      if (state.restarting) continue;
+      const lastActivityAt = state.lastActivityAt ?? 0;
+      if (lastActivityAt <= 0) continue;
+      const idleMs = now - lastActivityAt;
+      if (idleMs < idleThresholdMs) continue;
+      stuck.push({ jid, idleMs });
+    }
+    return stuck;
+  }
+
   enqueueMessageCheck(groupJid: string): void {
     if (this.shuttingDown) return;
 
@@ -211,6 +281,12 @@ export class GroupQueue {
     if (state.active || (activeRunner && activeRunner !== groupJid)) {
       state.pendingMessages = true;
       this.waitingGroups.add(groupJid);
+      // Write _drain to the actual active runner so sibling JIDs sharing one
+      // folder also unblock immediately instead of waiting for idle timeout.
+      this.requestDrainForActiveRunner(
+        groupJid,
+        'Drain sentinel written during enqueueMessageCheck to unblock pending messages',
+      );
       logger.debug(
         { groupJid, activeRunner: activeRunner || groupJid },
         'Group runner active, message queued',
@@ -296,6 +372,12 @@ export class GroupQueue {
     state.displayName = displayName || null;
     if (groupFolder) state.groupFolder = groupFolder;
     state.agentId = agentId || null;
+    if (state.pendingMessages && !state.agentId) {
+      this.requestDrainForActiveRunner(
+        groupJid,
+        'Drain sentinel written during registerProcess for already-pending messages',
+      );
+    }
   }
 
   /**
@@ -378,18 +460,14 @@ export class GroupQueue {
     // instead of IPC-injecting into the running query. This aligns with
     // Claude Code's one-question-one-answer model: the current query finishes
     // first, then drainGroup starts a new container to process queued messages.
-    if (intent === 'continue' && state.agentId === null) {
+    if (intent === 'continue' && state.agentId === null && state.queryInFlight) {
       const own = this.getGroup(groupJid);
       own.pendingMessages = true;
       this.waitingGroups.add(groupJid);
-      if (!own.drainSentinelWritten) {
-        this.writeDrainSentinel(state);
-        own.drainSentinelWritten = true;
-        logger.info(
-          { groupJid },
-          'Continue intent queued, drain sentinel written',
-        );
-      }
+      this.requestDrainForActiveRunner(
+        groupJid,
+        'Continue intent queued, drain sentinel written',
+      );
       return 'queued';
     }
 
@@ -404,6 +482,7 @@ export class GroupQueue {
         JSON.stringify({ type: 'message', text, images }),
       );
       fs.renameSync(tempPath, filepath);
+      state.queryInFlight = true;
       onInjected?.();
       return intent === 'correction' ? 'interrupted_correction' : 'sent';
     } catch {
@@ -433,13 +512,14 @@ export class GroupQueue {
    * is only checked after the current query completes, ensuring one-question-
    * one-answer semantics.
    */
-  private writeDrainSentinel(state: ActiveGroupState): void {
+  private writeDrainSentinel(state: ActiveGroupState): boolean {
     const inputDir = this.resolveIpcInputDir(state);
     try {
       fs.mkdirSync(inputDir, { recursive: true });
       fs.writeFileSync(path.join(inputDir, '_drain'), '');
+      return true;
     } catch {
-      // ignore
+      return false;
     }
   }
 
@@ -730,6 +810,8 @@ export class GroupQueue {
     const isHostMode = this.isHostMode(groupJid);
     state.active = true;
     state.activeRunnerIsTask = false;
+    state.lastActivityAt = Date.now();
+    state.queryInFlight = true;
     state.pendingMessages = false;
     this.waitingGroups.delete(groupJid);
     this.activeCount++;
@@ -770,6 +852,8 @@ export class GroupQueue {
     } finally {
       state.active = false;
       state.drainSentinelWritten = false;
+      state.lastActivityAt = null;
+      state.queryInFlight = false;
       state.process = null;
       state.containerName = null;
       state.displayName = null;
@@ -804,6 +888,8 @@ export class GroupQueue {
     const isHostMode = this.isHostMode(groupJid);
     state.active = true;
     state.activeRunnerIsTask = true;
+    state.lastActivityAt = Date.now();
+    state.queryInFlight = false;
     this.waitingGroups.delete(groupJid);
     this.activeCount++;
     if (isHostMode) {
@@ -836,6 +922,8 @@ export class GroupQueue {
       state.active = false;
       state.activeRunnerIsTask = false;
       state.drainSentinelWritten = false;
+      state.lastActivityAt = null;
+      state.queryInFlight = false;
       state.process = null;
       state.containerName = null;
       state.displayName = null;
