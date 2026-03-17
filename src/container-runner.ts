@@ -968,7 +968,7 @@ export async function runHostAgent(
     );
   }
 
-  // Warn if dist may be stale (src newer than dist)
+  // Auto-rebuild if dist is stale (src newer than dist)
   try {
     const distMtime = fs.statSync(agentRunnerDist).mtimeMs;
     const srcDir = path.join(agentRunnerRoot, 'src');
@@ -977,10 +977,27 @@ export async function runHostAgent(
       ...srcFiles.map((f) => fs.statSync(path.join(srcDir, f)).mtimeMs),
     );
     if (newestSrc > distMtime) {
-      logger.warn(
+      logger.info(
         { group: group.name },
-        `agent-runner dist 可能已过期（src 比 dist 新）。建议执行：${setupBuildHint}`,
+        'agent-runner dist 已过期，自动重新编译...',
       );
+      try {
+        const { execSync } = await import('child_process');
+        execSync('npm run build', {
+          cwd: agentRunnerRoot,
+          stdio: 'pipe',
+          timeout: 30_000,
+        });
+        logger.info(
+          { group: group.name },
+          'agent-runner 自动编译完成',
+        );
+      } catch (buildErr) {
+        logger.warn(
+          { group: group.name, err: buildErr },
+          `agent-runner 自动编译失败，使用旧版 dist。手动执行：${setupBuildHint}`,
+        );
+      }
     }
   } catch {
     // Best effort, don't block execution

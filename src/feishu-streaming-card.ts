@@ -14,6 +14,7 @@
 import * as lark from '@larksuiteoapi/node-sdk';
 import { createHash } from 'crypto';
 import { logger } from './logger.js';
+import { optimizeMarkdownStyle } from './feishu-markdown-style.js';
 
 // ─── Types ────────────────────────────────────────────────────
 
@@ -205,6 +206,7 @@ interface CardContentResult {
 /**
  * Build the content elements shared by both Legacy and Schema 2.0 card builders.
  * Splits long text, handles `---` section dividers, and extracts the title.
+ * Applies optimizeMarkdownStyle() for proper Feishu rendering.
  */
 function buildCardContent(
   text: string,
@@ -213,7 +215,9 @@ function buildCardContent(
 ): CardContentResult {
   const { title: extractedTitle, body } = extractTitleAndBody(text);
   const title = overrideTitle || extractedTitle;
-  const contentToRender = body || text.trim();
+  // Apply Markdown optimization for Feishu card rendering
+  const rawContent = body || text.trim();
+  const contentToRender = optimizeMarkdownStyle(rawContent, 2);
   const elements: Array<Record<string, unknown>> = [];
 
   if (contentToRender.length > CARD_MD_LIMIT) {
@@ -491,7 +495,11 @@ class CardKitBackend {
 
     const cardId = resp?.data?.card_id;
     if (!cardId) {
-      throw new Error('CardKit card.create returned no card_id');
+      const code = (resp as any)?.code;
+      const msg = (resp as any)?.msg;
+      throw new Error(
+        `CardKit card.create returned no card_id (code=${code}, msg=${msg})`,
+      );
     }
 
     this.cardId = cardId;
@@ -514,7 +522,7 @@ class CardKitBackend {
     }
 
     const content = JSON.stringify({
-      type: 'template',
+      type: 'card',
       data: { card_id: this.cardId },
     });
 
@@ -569,9 +577,11 @@ class CardKitBackend {
 
 }
 
-// ─── CardKit V2 Streaming Backend ─────────────────────────────
+// ─── CardKit Streaming Backend (v1 API with streaming_mode) ───
 
-class CardKitV2Backend {
+const STREAMING_ELEMENT_ID = 'streaming_content';
+
+class CardKitStreamingBackend {
   private cardId: string | null = null;
   private _messageId: string | null = null;
   private sequence = 0;
@@ -586,12 +596,19 @@ class CardKitV2Backend {
   }
 
   /**
-   * Create a v2 streaming card and send it as a message.
-   * Returns the message_id.
+   * Create a streaming card entity via cardkit.v1.card.create,
+   * then send it as an IM message referencing the card_id.
+   *
+   * Uses the same approach as OpenClaw-Lark:
+   * - cardkit.v1.card.create with streaming_mode: true
+   * - im.message.create/reply with content: { type: "card", data: { card_id } }
+   * - cardkit.v1.cardElement.content for typewriter streaming
+   * - cardkit.v1.card.settings to close streaming_mode
+   * - cardkit.v1.card.update for final full card
    */
   async createStreamingCard(
     chatId: string,
-    initialText: string,
+    _initialText: string,
     replyToMsgId?: string,
   ): Promise<string> {
     const cardJson = {
@@ -605,16 +622,17 @@ class CardKitV2Backend {
         elements: [
           {
             tag: 'markdown',
-            content: initialText || '💭 思考中...',
+            content: '',
             text_align: 'left',
             text_size: 'normal',
-            element_id: 'streaming_content',
+            element_id: STREAMING_ELEMENT_ID,
           },
         ],
       },
     };
 
-    const createResp = await (this.client as any).cardkit.v2.card.create({
+    // Step 1: Create card entity via CardKit v1 API
+    const createResp = await this.client.cardkit.v1.card.create({
       data: {
         type: 'card_json',
         data: JSON.stringify(cardJson),
@@ -623,15 +641,20 @@ class CardKitV2Backend {
 
     const cardId = createResp?.data?.card_id;
     if (!cardId) {
-      throw new Error('CardKit v2 card.create returned no card_id');
+      const code = (createResp as any)?.code;
+      const msg = (createResp as any)?.msg;
+      throw new Error(
+        `CardKit card.create returned no card_id (code=${code}, msg=${msg})`,
+      );
     }
     this.cardId = cardId;
     this.sequence = 1;
-    logger.debug({ cardId }, 'CardKit v2 streaming card created');
+    logger.debug({ cardId }, 'CardKit streaming card created');
 
-    // Send the card as a message
+    // Step 2: Send IM message referencing card_id
+    // Use { type: "card", data: { card_id } } format (OpenClaw pattern)
     const content = JSON.stringify({
-      type: 'template',
+      type: 'card',
       data: { card_id: this.cardId },
     });
 
@@ -654,43 +677,60 @@ class CardKitV2Backend {
 
     const messageId = resp?.data?.message_id;
     if (!messageId) {
-      throw new Error('No message_id in v2 sendCard response');
+      throw new Error('No message_id in streaming card send response');
     }
     this._messageId = messageId;
     return messageId;
   }
 
   /**
-   * Push incremental text content to the streaming card.
+   * Stream text content to the card via cardElement.content (typewriter effect).
+   * The content is cumulative (full text, not a delta).
+   * Feishu auto-diffs and renders incremental changes.
    */
   async streamContent(text: string): Promise<'ok' | 'fail'> {
     if (!this.cardId) return 'fail';
     try {
-      await (this.client as any).cardkit.v2.card.streamContent({
-        path: { card_id: this.cardId },
+      this.sequence++;
+      const resp = await this.client.cardkit.v1.cardElement.content({
         data: {
           content: text,
-          sequence: ++this.sequence,
+          sequence: this.sequence,
+        },
+        path: {
+          card_id: this.cardId,
+          element_id: STREAMING_ELEMENT_ID,
         },
       });
+      const code = (resp as any)?.code;
+      if (code && code !== 0) {
+        logger.debug(
+          { cardId: this.cardId, code, msg: (resp as any)?.msg, seq: this.sequence },
+          'cardElement.content returned non-zero code',
+        );
+        // Rate limit (230020): skip, don't count as failure
+        if (code === 230020) return 'ok';
+        return 'fail';
+      }
       return 'ok';
     } catch (err) {
-      logger.debug({ err, cardId: this.cardId }, 'V2 streamContent failed');
+      logger.debug({ err, cardId: this.cardId, seq: this.sequence }, 'cardElement.content failed');
       return 'fail';
     }
   }
 
   /**
-   * Close streaming mode on the card.
+   * Close streaming mode via card.settings.
    */
   async stopStreaming(): Promise<void> {
     if (!this.cardId) return;
-    await (this.client as any).cardkit.v2.card.setStreamingMode({
-      path: { card_id: this.cardId },
+    this.sequence++;
+    await this.client.cardkit.v1.card.settings({
       data: {
-        streaming_mode: false,
-        sequence: ++this.sequence,
+        settings: JSON.stringify({ streaming_mode: false }),
+        sequence: this.sequence,
       },
+      path: { card_id: this.cardId },
     });
   }
 
@@ -699,12 +739,15 @@ class CardKitV2Backend {
    */
   async updateFinal(cardJson: object): Promise<void> {
     if (!this.cardId) return;
-    await (this.client as any).cardkit.v2.card.update({
+    this.sequence++;
+    await this.client.cardkit.v1.card.update({
       path: { card_id: this.cardId },
       data: {
-        type: 'card_json',
-        data: JSON.stringify(cardJson),
-        sequence: ++this.sequence,
+        card: {
+          type: 'card_json' as const,
+          data: JSON.stringify(cardJson),
+        },
+        sequence: this.sequence,
       },
     });
   }
@@ -870,7 +913,7 @@ export class StreamingCardController {
   private toolCalls = new Map<string, { name: string; status: 'running' | 'complete' | 'error' }>();
   private startTime = 0;
   private backendMode: 'v2' | 'v1' | 'legacy' = 'v1';
-  private v2Backend: CardKitV2Backend | null = null;
+  private v2Backend: CardKitStreamingBackend | null = null;
 
   constructor(opts: StreamingCardOptions) {
     this.client = opts.client;
@@ -1031,9 +1074,9 @@ export class StreamingCardController {
   private async createInitialCard(): Promise<void> {
     const initialText = this.accumulatedText || (this.thinking ? '' : '...');
 
-    // ── Try CardKit v2 (streaming mode) first ──
+    // ── Try CardKit streaming (cardElement.content typewriter) ──
     try {
-      this.v2Backend = new CardKitV2Backend(this.client);
+      this.v2Backend = new CardKitStreamingBackend(this.client);
       const messageId = await this.v2Backend.createStreamingCard(
         this.chatId, initialText, this.replyToMsgId,
       );
@@ -1041,26 +1084,26 @@ export class StreamingCardController {
       this.messageId = messageId;
       this.backendMode = 'v2';
       this.startTime = Date.now();
-      // V2 mode: 300ms interval, 30 char threshold
+      // Streaming mode: 300ms interval, 30 char threshold
       this.flushCtrl.dispose();
       this.flushCtrl = new FlushController(300, 30);
       this.maxPatchFailures = 3;
 
       logger.debug(
-        { chatId: this.chatId, messageId, mode: 'v2' },
-        'Streaming card created via CardKit v2',
+        { chatId: this.chatId, messageId, mode: 'cardkit-streaming' },
+        'Streaming card created via CardKit cardElement.content',
       );
       this.finishCardCreation();
       return;
-    } catch (v2Err) {
+    } catch (streamErr) {
       logger.info(
-        { err: v2Err, chatId: this.chatId },
-        'CardKit v2 unavailable, trying v1',
+        { err: streamErr, chatId: this.chatId },
+        'CardKit streaming unavailable, trying CardKit full-update',
       );
       this.v2Backend = null;
     }
 
-    // ── Try CardKit v1 (full JSON update) ──
+    // ── Try CardKit full-update (card.update with full JSON) ──
     try {
       this.multiCard = new MultiCardManager(
         this.client,
@@ -1084,10 +1127,10 @@ export class StreamingCardController {
         'Streaming card created via CardKit v1',
       );
     } catch (v1Err) {
-      // CardKit v1 failed — fall back to legacy message.create + message.patch
+      // CardKit full-update failed — fall back to legacy message.create + message.patch
       logger.info(
         { err: v1Err, chatId: this.chatId },
-        'CardKit v1 unavailable, falling back to message.patch',
+        'CardKit full-update unavailable, falling back to message.patch',
       );
       this.multiCard = null;
       this.useCardKit = false;
@@ -1255,6 +1298,7 @@ export class StreamingCardController {
   /**
    * Build the text content for v2 streamContent calls.
    * Includes tool progress appended to the main text.
+   * Applies optimizeMarkdownStyle() for proper Feishu rendering.
    */
   private buildStreamContentText(): string {
     let content = '';
@@ -1263,6 +1307,8 @@ export class StreamingCardController {
     } else {
       content = this.accumulatedText || '💭 思考中...';
     }
+    // Apply Markdown optimization for streaming content
+    content = optimizeMarkdownStyle(content, 2);
     const toolMd = buildToolProgressMarkdown(this.toolCalls);
     if (toolMd) {
       content += '\n\n---\n' + toolMd;

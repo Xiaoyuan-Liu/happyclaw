@@ -21,6 +21,7 @@ import {
   resolveJidByMessageId,
   getStreamingSession,
 } from './feishu-streaming-card.js';
+import { optimizeMarkdownStyle } from './feishu-markdown-style.js';
 
 // ─── FeishuConnection Interface ────────────────────────────────
 
@@ -385,15 +386,19 @@ function getFileType(
 }
 
 /**
- * Build a Feishu interactive card from markdown text.
- * Extracts headings as card title, splits content into visual sections.
+ * Build a Feishu interactive card (Schema 2.0) from markdown text.
+ * Applies optimizeMarkdownStyle() for proper rendering in Feishu cards:
+ * - Heading demotion (H1→H4, H2~H6→H5)
+ * - Code block / table spacing with <br>
+ * - Invalid image cleanup
  */
 function buildInteractiveCard(text: string): object {
+  const optimized = optimizeMarkdownStyle(text, 2);
   const lines = text.split('\n');
   let title = '';
   let bodyStartIdx = 0;
 
-  // Extract title from first heading if present
+  // Extract title from first heading if present (use original text for title)
   for (let i = 0; i < lines.length; i++) {
     if (!lines[i].trim()) continue;
     if (/^#{1,3}\s+/.test(lines[i])) {
@@ -403,7 +408,22 @@ function buildInteractiveCard(text: string): object {
     break;
   }
 
-  const body = lines.slice(bodyStartIdx).join('\n').trim();
+  // Apply optimizeMarkdownStyle to body (title was already extracted from original)
+  const optimizedLines = optimized.split('\n');
+  // Skip lines corresponding to the title in optimized text
+  let optimizedBody: string;
+  if (bodyStartIdx > 0) {
+    // Find the first non-empty line in optimized text and skip it (it's the demoted title)
+    let skipIdx = 0;
+    for (let i = 0; i < optimizedLines.length; i++) {
+      if (!optimizedLines[i].trim()) continue;
+      skipIdx = i + 1;
+      break;
+    }
+    optimizedBody = optimizedLines.slice(skipIdx).join('\n').trim();
+  } else {
+    optimizedBody = optimized.trim();
+  }
 
   // Generate title if no heading found — use first line preview
   if (!title) {
@@ -418,7 +438,7 @@ function buildInteractiveCard(text: string): object {
 
   // Build card elements
   const elements: Array<Record<string, unknown>> = [];
-  const contentToRender = body || text.trim();
+  const contentToRender = optimizedBody || optimized.trim();
 
   if (contentToRender.length > CARD_MD_LIMIT) {
     // Long content: split into multiple markdown elements
@@ -438,16 +458,17 @@ function buildInteractiveCard(text: string): object {
 
   // Ensure at least one element
   if (elements.length === 0) {
-    elements.push({ tag: 'markdown', content: text.trim() });
+    elements.push({ tag: 'markdown', content: optimized.trim() });
   }
 
   return {
+    schema: '2.0',
     config: { wide_screen_mode: true },
     header: {
       title: { tag: 'plain_text', content: title },
       template: 'indigo',
     },
-    elements,
+    body: { elements },
   };
 }
 
@@ -1474,13 +1495,19 @@ export function createFeishuConnection(
           } catch (err) {
             logger.warn(
               { err, chatId },
-              'Feishu interactive reply failed, fallback to plain text',
+              'Feishu interactive reply failed, fallback to post+md',
             );
+            // Fallback: use post message with md tag for proper Markdown rendering
+            const postContent = JSON.stringify({
+              zh_cn: {
+                content: [[{ tag: 'md', text: optimizeMarkdownStyle(text, 1) }]],
+              },
+            });
             await client.im.message.reply({
               path: { message_id: lastMsgId },
               data: {
-                content: JSON.stringify({ text }),
-                msg_type: 'text',
+                content: postContent,
+                msg_type: 'post',
               },
             });
           }
@@ -1497,14 +1524,20 @@ export function createFeishuConnection(
           } catch (err) {
             logger.warn(
               { err, chatId },
-              'Feishu interactive create failed, fallback to plain text',
+              'Feishu interactive create failed, fallback to post+md',
             );
+            // Fallback: use post message with md tag for proper Markdown rendering
+            const postContent = JSON.stringify({
+              zh_cn: {
+                content: [[{ tag: 'md', text: optimizeMarkdownStyle(text, 1) }]],
+              },
+            });
             await client.im.v1.message.create({
               params: { receive_id_type: 'chat_id' },
               data: {
                 receive_id: chatId,
-                msg_type: 'text',
-                content: JSON.stringify({ text }),
+                msg_type: 'post',
+                content: postContent,
               },
             });
           }

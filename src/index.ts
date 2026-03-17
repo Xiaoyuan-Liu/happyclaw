@@ -4859,11 +4859,11 @@ async function main(): Promise<void> {
     shuttingDown = true;
     logger.info({ signal }, 'Shutdown signal received, cleaning up...');
 
-    // Force exit after 5s if graceful shutdown hangs
+    // Force exit after 2s if graceful shutdown hangs
     const forceExitTimer = setTimeout(() => {
-      logger.warn('Graceful shutdown timed out after 5s, force exiting');
+      logger.warn('Graceful shutdown timed out, force exiting');
       process.exit(1);
-    }, 5000);
+    }, 2000);
     forceExitTimer.unref();
 
     if (feishuSyncInterval) {
@@ -4876,28 +4876,25 @@ async function main(): Promise<void> {
     } catch (err) {
       logger.warn({ err }, 'Error shutting down terminals');
     }
-    // Abort all active streaming cards before disconnecting IM,
-    // so users see "服务维护中" instead of a stuck "生成中..." card.
-    try {
-      await abortAllStreamingSessions('服务维护中');
-    } catch (err) {
-      logger.warn({ err }, 'Error aborting streaming sessions');
-    }
-    try {
-      await imManager.disconnectAll();
-    } catch (err) {
-      logger.warn({ err }, 'Error disconnecting IM connections');
-    }
-    try {
-      await shutdownWebServer();
-    } catch (err) {
-      logger.warn({ err }, 'Error shutting down web server');
-    }
-    try {
-      await queue.shutdown(10000);
-    } catch (err) {
-      logger.warn({ err }, 'Error shutting down queue');
-    }
+
+    // Run cleanup tasks concurrently with a tight timeout
+    await Promise.allSettled([
+      // Abort all active streaming cards before disconnecting IM,
+      // so users see "服务维护中" instead of a stuck "生成中..." card.
+      abortAllStreamingSessions('服务维护中').catch((err) =>
+        logger.warn({ err }, 'Error aborting streaming sessions'),
+      ),
+      imManager.disconnectAll().catch((err) =>
+        logger.warn({ err }, 'Error disconnecting IM connections'),
+      ),
+      shutdownWebServer().catch((err) =>
+        logger.warn({ err }, 'Error shutting down web server'),
+      ),
+      queue.shutdown(1500).catch((err) =>
+        logger.warn({ err }, 'Error shutting down queue'),
+      ),
+    ]);
+
     try {
       closeDatabase();
     } catch (err) {

@@ -52,9 +52,13 @@ start: ## 一键启动生产环境
 	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
 	@if command -v docker >/dev/null 2>&1 && ! docker image inspect happyclaw-agent:latest >/dev/null 2>&1; then echo "🐳 构建 Agent 容器镜像..."; ./container/build.sh; fi
 ifeq ($(HAS_BUN),1)
-	@if [ -n "$$(find shared/ -newer web/src/stream-event.types.ts \( -name '*.ts' \) 2>/dev/null | head -1)" ]; then echo "🔄 检测到 shared/ 类型变更，同步类型..."; $(MAKE) sync-types; fi
+	@NEED_SYNC=0; \
+	for target in src/stream-event.types.ts web/src/stream-event.types.ts container/agent-runner/src/stream-event.types.ts src/image-detector.ts container/agent-runner/src/image-detector.ts; do \
+	  if [ ! -f "$$target" ] || [ -n "$$(find shared/ -newer "$$target" -name '*.ts' 2>/dev/null | head -1)" ]; then NEED_SYNC=1; break; fi; \
+	done; \
+	if [ "$$NEED_SYNC" = "1" ]; then echo "🔄 检测到 shared/ 类型变更，同步类型..."; $(MAKE) sync-types; fi
 	@if [ ! -f web/dist/index.html ] || [ -n "$$(find web/src/ -newer web/dist/index.html \( -name '*.ts' -o -name '*.tsx' -o -name '*.css' \) 2>/dev/null | head -1)" ]; then echo "🔨 检测到前端源码变更，重新编译前端..."; cd web && bun run build; fi
-	@if [ ! -f container/agent-runner/dist/.tsbuildinfo ] || [ -n "$$(find container/agent-runner/src/ -newer container/agent-runner/dist/.tsbuildinfo \( -name '*.ts' \) 2>/dev/null | head -1)" ]; then echo "🔨 检测到 agent-runner 源码变更，重新编译..."; cd container/agent-runner && bun run build; fi
+	@if [ ! -f container/agent-runner/dist/index.js ] || [ -n "$$(find container/agent-runner/src/ -newer container/agent-runner/dist/index.js \( -name '*.ts' \) 2>/dev/null | head -1)" ]; then echo "🔨 检测到 agent-runner 源码变更，重新编译..."; cd container/agent-runner && bun run build; fi
 	@echo "⚡ Bun 模式：直接运行 TypeScript，跳过后端编译"
 	bun src/index.ts
 else
