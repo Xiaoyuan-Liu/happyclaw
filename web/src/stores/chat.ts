@@ -180,6 +180,9 @@ interface ChatState {
   agentMessages: Record<string, Message[]>;          // agentId → messages
   agentWaiting: Record<string, boolean>;             // agentId → waiting for reply
   agentHasMore: Record<string, boolean>;             // agentId → has more messages
+  // BTW (side question) state — ephemeral, not persisted
+  btwResponses: Record<string, Array<{ id: string; question: string; answer: string; timestamp: string }>>;
+  btwLoading: Record<string, boolean>;
   loadGroups: () => Promise<void>;
   selectGroup: (jid: string) => void;
   loadMessages: (jid: string, loadMore?: boolean) => Promise<void>;
@@ -225,6 +228,9 @@ interface ChatState {
   drafts: Record<string, string>;
   saveDraft: (jid: string, text: string) => void;
   clearDraft: (jid: string) => void;
+  // BTW actions
+  handleBtwResponse: (chatJid: string, id: string, question: string, answer: string, timestamp: string, final: boolean) => void;
+  dismissBtw: (chatJid: string, id: string) => void;
 }
 
 const DEFAULT_STREAMING_STATE: StreamingState = {
@@ -742,6 +748,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   agentWaiting: {},
   agentHasMore: {},
   drafts: {},
+  btwResponses: {},
+  btwLoading: {},
 
   loadGroups: async () => {
     set({ loading: true });
@@ -905,6 +913,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   sendMessage: async (jid: string, content: string, attachments?: Array<{ data: string; mimeType: string }>) => {
     try {
+      // /btw interception: send via WebSocket directly, bypass REST + DB
+      if (content.trim().startsWith('/btw ')) {
+        const question = content.trim().slice(5);
+        if (question) {
+          set((s) => ({ btwLoading: { ...s.btwLoading, [jid]: true } }));
+          wsManager.send({ type: 'send_message', chatJid: jid, content: content.trim() });
+        }
+        return;
+      }
+
       // streaming 状态由以下 3 条路径正确清理，sendMessage 不应无条件清空：
       // 1. handleWsNewMessage 收到 is_from_me 消息时
       // 2. agent_reply WebSocket 事件时
@@ -2297,5 +2315,30 @@ export const useChatStore = create<ChatState>((set, get) => ({
       delete next[jid];
       return { drafts: next };
     });
+  },
+
+  // BTW actions
+  handleBtwResponse: (chatJid, id, question, answer, timestamp, final) => {
+    set((s) => {
+      const existing = s.btwResponses[chatJid] || [];
+      const idx = existing.findIndex((b) => b.id === id);
+      const entry = { id, question, answer, timestamp };
+      const updated = idx >= 0
+        ? existing.map((b, i) => i === idx ? entry : b)
+        : [...existing, entry];
+      return {
+        btwResponses: { ...s.btwResponses, [chatJid]: updated },
+        btwLoading: { ...s.btwLoading, [chatJid]: !final },
+      };
+    });
+  },
+
+  dismissBtw: (chatJid, id) => {
+    set((s) => ({
+      btwResponses: {
+        ...s.btwResponses,
+        [chatJid]: (s.btwResponses[chatJid] || []).filter((b) => b.id !== id),
+      },
+    }));
   },
 }));

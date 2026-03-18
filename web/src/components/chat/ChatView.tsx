@@ -267,7 +267,14 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
       }
     });
     // agent_status 已提升到 AppLayout 全局监听
-    return () => { unsub1(); unsub2(); unsub3(); unsub4(); };
+    // BTW 旁路回答
+    const { handleBtwResponse } = useChatStore.getState();
+    const unsub5 = wsManager.on('btw_response', (data: any) => {
+      if (data.chatJid === groupJid) {
+        handleBtwResponse(groupJid, data.id, data.question, data.answer, data.timestamp, data.final ?? true);
+      }
+    });
+    return () => { unsub1(); unsub2(); unsub3(); unsub4(); unsub5(); };
   }, [groupJid, handleStreamEvent, handleWsNewMessage, handleStreamSnapshot]);
 
   const [scrollTrigger, setScrollTrigger] = useState(0);

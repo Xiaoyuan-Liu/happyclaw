@@ -68,6 +68,7 @@ export interface WebDeps {
   } | null>;
   clearImFailCounts?: (jid: string) => void;
   updateReplyRoute?: (folder: string, sourceJid: string | null) => void;
+  executeBtw?: (chatJid: string, question: string) => Promise<void>;
   triggerTaskRun?: (taskId: string) => { success: boolean; error?: string };
   handleSpawnCommand?: (
     chatJid: string,
