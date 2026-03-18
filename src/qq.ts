@@ -1376,8 +1376,8 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         ).trim();
         try {
           const reply = await opts.onCommand(jid, cmdBody);
-          if (reply) {
-            await sendQQMessage('c2c', userOpenId, markdownToPlainText(reply));
+          if (reply != null) {
+            if (reply) await sendQQMessage('c2c', userOpenId, markdownToPlainText(reply));
             return;
           }
         } catch (err) {
@@ -1528,12 +1528,14 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
         ).trim();
         try {
           const reply = await opts.onCommand(jid, cmdBody);
-          if (reply) {
-            await sendQQMessage(
-              'group',
-              groupOpenId,
-              markdownToPlainText(reply),
-            );
+          if (reply != null) {
+            if (reply) {
+              await sendQQMessage(
+                'group',
+                groupOpenId,
+                markdownToPlainText(reply),
+              );
+            }
             return;
           }
         } catch (err) {
