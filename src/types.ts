@@ -384,6 +384,15 @@ export type WsMessageOut =
         systemStatus: string | null;
         turnId?: string;
       };
+    }
+  | {
+      type: 'btw_response';
+      chatJid: string;
+      id: string;
+      question: string;
+      answer: string;
+      timestamp: string;
+      final: boolean;
     };
 
 export type WsMessageIn =
