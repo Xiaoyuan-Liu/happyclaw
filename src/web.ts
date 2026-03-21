@@ -362,8 +362,13 @@ async function handleWebUserMessage(
 
   // Only advance per-group cursor when we piped directly into a running container.
   // For queued processing, processGroupMessages must still see this message from DB.
+  //
+  // When piped to active, we also mark the group as having pending IPC-injected
+  // messages. If the agent crashes without processing them, the close handler
+  // resets pendingMessages so drainGroup re-reads from DB.
   if (pipedToActive) {
     deps.setLastAgentTimestamp(chatJid, { timestamp, id: messageId });
+    deps.queue.markIpcInjectedMessage(chatJid);
   }
   deps.advanceGlobalCursor({ timestamp, id: messageId });
   return { ok: true, messageId, timestamp };

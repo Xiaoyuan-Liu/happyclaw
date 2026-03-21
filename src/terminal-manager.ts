@@ -36,6 +36,8 @@ type TerminalSession = PtyTerminalSession | PipeTerminalSession;
 
 export class TerminalManager {
   private sessions = new Map<string, TerminalSession>();
+  /** Set to true when node-pty is detected as broken (e.g. Node.js version incompatibility) */
+  private ptyDisabled = false;
 
   start(
     groupJid: string,
@@ -61,7 +63,7 @@ export class TerminalManager {
       'else exec sh -i; fi';
 
     // Try PTY mode via node subprocess (Bun can't load node-pty natively)
-    if (fs.existsSync(PTY_WORKER_PATH)) {
+    if (!this.ptyDisabled && fs.existsSync(PTY_WORKER_PATH)) {
       try {
         const workerArgs = JSON.stringify({
           file: 'docker',
@@ -84,6 +86,10 @@ export class TerminalManager {
           createdAt: Date.now(),
           stoppedManually: false,
         };
+
+        // Track whether PTY worker has been alive long enough to be considered healthy
+        let ptyHealthy = false;
+        const ptyHealthTimer = setTimeout(() => { ptyHealthy = true; }, 2000);
 
         // Parse JSON-line messages from the worker
         let buffer = '';
@@ -116,19 +122,29 @@ export class TerminalManager {
         });
 
         proc.on('close', (exitCode) => {
-          if (!session.stoppedManually && this.sessions.has(groupJid)) {
-            logger.info({ groupJid, exitCode }, 'PTY worker process closed');
+          clearTimeout(ptyHealthTimer);
+          if (session.stoppedManually || !this.sessions.has(groupJid)) return;
+          // If PTY worker crashes quickly (< 2s), node-pty is broken — fall back to pipe mode permanently
+          if (!ptyHealthy) {
+            logger.warn({ groupJid, exitCode }, 'PTY worker crashed on startup, disabling PTY and falling back to pipe mode');
+            this.ptyDisabled = true;
             this.sessions.delete(groupJid);
-            onExit(exitCode ?? 1);
+            this.startPipeMode(groupJid, containerName, shellBootstrap, onData, onExit);
+            return;
           }
+          logger.info({ groupJid, exitCode }, 'PTY worker process closed');
+          this.sessions.delete(groupJid);
+          onExit(exitCode ?? 1);
         });
 
         proc.on('error', (err) => {
+          clearTimeout(ptyHealthTimer);
           logger.warn({ err, groupJid }, 'PTY worker spawn error');
           if (!session.stoppedManually && this.sessions.has(groupJid)) {
             this.sessions.delete(groupJid);
-            onData(`\r\n[terminal error: ${err.message}]\r\n`);
-            onExit(1);
+            // Disable PTY and fall back to pipe mode
+            this.ptyDisabled = true;
+            this.startPipeMode(groupJid, containerName, shellBootstrap, onData, onExit);
           }
         });
 
@@ -139,13 +155,24 @@ export class TerminalManager {
           { err, groupJid, containerName },
           'PTY worker spawn failed, falling back to pipe terminal',
         );
+        this.ptyDisabled = true;
       }
-    } else {
+    } else if (!fs.existsSync(PTY_WORKER_PATH)) {
       logger.warn({ path: PTY_WORKER_PATH }, 'PTY worker script not found, falling back to pipe terminal');
     }
 
-    // Fallback: pipe mode (no PTY, no prompt, line-based input)
-    const proc = spawn('docker', ['exec', '-i', '-u', 'node', containerName, '/bin/sh'], {
+    this.startPipeMode(groupJid, containerName, shellBootstrap, onData, onExit);
+  }
+
+  /** Pipe mode fallback (no PTY, line-based input) */
+  private startPipeMode(
+    groupJid: string,
+    containerName: string,
+    shellBootstrap: string,
+    onData: (data: string) => void,
+    onExit: (exitCode: number, signal?: number) => void,
+  ): void {
+    const proc = spawn('docker', ['exec', '-i', '-u', 'node', containerName, '/bin/sh', '-c', shellBootstrap], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: {
         ...process.env,

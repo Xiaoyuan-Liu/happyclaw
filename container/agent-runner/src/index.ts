@@ -1368,13 +1368,18 @@ async function runQuery(
  * When SDK has pending async resources (background Task tools, MCP connections),
  * process.exit() may hang indefinitely. Force SIGKILL after 5 seconds.
  * See GitHub issue #236.
+ *
+ * The timer must NOT use .unref() — if process.exit() silently fails to
+ * terminate (observed with SDK MCP transports holding the event loop),
+ * an unref'd timer won't keep the loop alive and the SIGKILL never fires.
+ * Using a ref'd timer guarantees the safety net triggers.
  */
 function forceExitWithSafetyNet(code: number): never {
   log(`Exiting with code ${code}, SIGKILL safety net in 5s`);
   setTimeout(() => {
     console.error('[agent-runner] process.exit() did not terminate, forcing SIGKILL');
     process.kill(process.pid, 'SIGKILL');
-  }, 5000).unref();
+  }, 5000);
   process.exit(code);
 }
 

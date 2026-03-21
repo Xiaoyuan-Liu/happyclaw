@@ -40,6 +40,12 @@ interface GroupState {
   restarting: boolean;
   /** True when a _drain sentinel has been written for the current active runner. */
   drainSentinelWritten: boolean;
+  /** True when messages have been IPC-injected into the running agent via sendMessage().
+   *  Used to detect lost messages on abnormal exit: if the agent crashes after IPC
+   *  injection, the caller already advanced the cursor so processGroupMessages won't
+   *  re-read those messages.  The close handler uses this flag to force pendingMessages
+   *  so drainGroup triggers a fresh run. */
+  hasIpcInjectedMessages: boolean;
 }
 
 type ActiveGroupState = GroupState & { groupFolder: string };
@@ -89,6 +95,7 @@ export class GroupQueue {
         retryTimer: null,
         restarting: false,
         drainSentinelWritten: false,
+        hasIpcInjectedMessages: false,
       };
       this.groups.set(groupJid, state);
     }
@@ -254,6 +261,18 @@ export class GroupQueue {
     const state = this.resolveActiveState(groupJid);
     if (!state?.active) return;
     state.lastActivityAt = Date.now();
+  }
+
+  /**
+   * Mark that a message was IPC-injected into the running agent.
+   * The caller (web.ts) has already advanced the per-group cursor for this
+   * message.  If the agent crashes without processing it, the close handler
+   * uses this flag to force pendingMessages so drainGroup re-reads from DB.
+   */
+  markIpcInjectedMessage(groupJid: string): void {
+    const state = this.resolveActiveState(groupJid);
+    if (!state?.active) return;
+    state.hasIpcInjectedMessages = true;
   }
 
   markRunnerQueryIdle(groupJid: string): void {
@@ -944,8 +963,21 @@ export class GroupQueue {
         }
         this.recoverUnconsumedIpc(groupJid, state, 'agent exit');
       }
+      // If messages were IPC-injected during this run, always mark pending
+      // so drainGroup triggers a fresh processGroupMessages.  If the agent
+      // already replied to them, processGroupMessages will find 0 new messages
+      // (cursor was committed) and return immediately — harmless.  If the
+      // agent crashed, this ensures the messages are re-read from DB.
+      if (state.hasIpcInjectedMessages) {
+        state.pendingMessages = true;
+        logger.debug(
+          { groupJid },
+          'IPC-injected messages detected, marking pending for safety re-check',
+        );
+      }
       state.active = false;
       state.drainSentinelWritten = false;
+      state.hasIpcInjectedMessages = false;
       state.lastActivityAt = null;
       state.queryInFlight = false;
       state.process = null;
