@@ -1423,10 +1423,14 @@ async function main(): Promise<void> {
   const memoryRecallPrompt = buildMemoryRecallPrompt(isHome, isAdminHome);
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 
-  // Clean up stale sentinels from previous container runs
+  // Clean up stale sentinels from previous container runs.
+  // Note: _drain is NOT cleaned here — the host's cleanupIpcSentinels() in
+  // runForGroup's finally block already removes stale sentinels between runs.
+  // A _drain present at startup was written by registerProcess() for the
+  // CURRENT run (indicating pending messages arrived during container boot).
+  // Deleting it here causes those messages to be silently lost (#xxx).
   try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
   cleanupStartupInterruptSentinel();
-  try { fs.unlinkSync(IPC_INPUT_DRAIN_SENTINEL); } catch { /* ignore */ }
 
   // Build initial prompt (drain any pending IPC messages too)
   let prompt = containerInput.prompt;
@@ -1454,9 +1458,10 @@ async function main(): Promise<void> {
   const MAX_OVERFLOW_RETRIES = 3;
   try {
     while (true) {
-      // 清理残留的 sentinel，防止空闲期间写入的信号影响下一次 query
+      // 清理残留的 _interrupt sentinel（空闲期间写入的中断信号不应影响下一次 query）。
+      // 注意：_drain 不在此处清理 — 如果 _drain 存在，说明有待处理的消息，
+      // pollIpcDuringQuery 会在查询结果后检测到并正确退出容器。
       try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
-      try { fs.unlinkSync(IPC_INPUT_DRAIN_SENTINEL); } catch { /* ignore */ }
       clearInterruptRequested();
 
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
