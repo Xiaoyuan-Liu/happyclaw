@@ -3219,6 +3219,140 @@ export function saveUserQQConfig(
   return normalized;
 }
 
+// ========== WeChat User IM Config ==========
+
+export interface UserWechatConfig {
+  botToken: string;
+  botName?: string;
+  enabled?: boolean;
+  updatedAt: string | null;
+}
+
+interface StoredWechatProviderConfigV1 {
+  version: 1;
+  botName?: string;
+  enabled?: boolean;
+  updatedAt: string;
+  secret: EncryptedSecrets;
+}
+
+interface WechatSecretPayload {
+  botToken: string;
+}
+
+function encryptWechatSecret(payload: WechatSecretPayload): EncryptedSecrets {
+  const key = getOrCreateEncryptionKey();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+
+  const plaintext = Buffer.from(JSON.stringify(payload), 'utf-8');
+  const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const tag = cipher.getAuthTag();
+
+  return {
+    iv: iv.toString('base64'),
+    tag: tag.toString('base64'),
+    data: encrypted.toString('base64'),
+  };
+}
+
+function decryptWechatSecret(secrets: EncryptedSecrets): WechatSecretPayload {
+  const key = getOrCreateEncryptionKey();
+  const iv = Buffer.from(secrets.iv, 'base64');
+  const tag = Buffer.from(secrets.tag, 'base64');
+  const encrypted = Buffer.from(secrets.data, 'base64');
+
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+
+  const decrypted = Buffer.concat([
+    decipher.update(encrypted),
+    decipher.final(),
+  ]).toString('utf-8');
+  const parsed = JSON.parse(decrypted) as Record<string, unknown>;
+  return {
+    botToken: normalizeSecret(parsed.botToken ?? '', 'botToken'),
+  };
+}
+
+export function getUserWechatConfig(userId: string): UserWechatConfig | null {
+  const filePath = path.join(userImDir(userId), 'wechat.json');
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const parsed = JSON.parse(content) as Record<string, unknown>;
+    if (parsed.version !== 1) return null;
+
+    const stored = parsed as unknown as StoredWechatProviderConfigV1;
+    const secret = decryptWechatSecret(stored.secret);
+    return {
+      botToken: secret.botToken,
+      botName: (stored.botName as string) || undefined,
+      enabled: stored.enabled,
+      updatedAt: stored.updatedAt || null,
+    };
+  } catch (err) {
+    logger.warn({ err, userId }, 'Failed to read user WeChat config');
+    return null;
+  }
+}
+
+export function saveUserWechatConfig(
+  userId: string,
+  next: Omit<UserWechatConfig, 'updatedAt'>,
+): UserWechatConfig {
+  const normalized: UserWechatConfig = {
+    botToken: normalizeSecret(next.botToken, 'botToken'),
+    botName: next.botName,
+    enabled: next.enabled,
+    updatedAt: new Date().toISOString(),
+  };
+
+  const payload: StoredWechatProviderConfigV1 = {
+    version: 1,
+    botName: normalized.botName,
+    enabled: normalized.enabled,
+    updatedAt: normalized.updatedAt || new Date().toISOString(),
+    secret: encryptWechatSecret({ botToken: normalized.botToken }),
+  };
+
+  const dir = userImDir(userId);
+  fs.mkdirSync(dir, { recursive: true });
+  const filePath = path.join(dir, 'wechat.json');
+  const tmp = `${filePath}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + '\n', 'utf-8');
+  fs.renameSync(tmp, filePath);
+  return normalized;
+}
+
+/**
+ * Get WeChat long-poll sync state (get_updates_buf).
+ * Stored as plain JSON — not a secret, just an opaque protocol blob.
+ */
+export function getWechatSyncState(userId: string): string | undefined {
+  const filePath = path.join(userImDir(userId), 'wechat-sync.json');
+  try {
+    if (!fs.existsSync(filePath)) return undefined;
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const parsed = JSON.parse(content) as { buf?: string };
+    return parsed.buf;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Save WeChat long-poll sync state.
+ */
+export function saveWechatSyncState(userId: string, buf: string): void {
+  const dir = userImDir(userId);
+  fs.mkdirSync(dir, { recursive: true });
+  const filePath = path.join(dir, 'wechat-sync.json');
+  const tmp = `${filePath}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify({ buf }) + '\n', 'utf-8');
+  fs.renameSync(tmp, filePath);
+}
+
 // ─── System settings (plain JSON, no encryption) ─────────────────
 
 const SYSTEM_SETTINGS_FILE = path.join(

@@ -187,6 +187,14 @@ export function SetupChannelsPage() {
           </div>
         </section>
 
+        {/* WeChat */}
+        <section className="bg-card rounded-xl border border-border shadow-sm p-5">
+          <h2 className="text-base font-semibold text-foreground mb-3">微信</h2>
+          <p className="text-xs text-muted-foreground mb-3">
+            微信渠道需要扫码登录，可在设置 → 消息通道中配置。
+          </p>
+        </section>
+
         {/* Actions */}
         <div className="flex flex-col sm:flex-row gap-3 justify-end">
           <Button variant="outline" onClick={handleSkip}>
