@@ -2154,6 +2154,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             }
           }
 
+          // Reset idle timer on stream events so long-running tool calls
+          // (e.g. MCP batch writes) don't get killed while the agent is
+          // actively working. Previously only final results triggered a reset.
+          resetIdleTimer();
           return;
         }
 
@@ -4285,6 +4289,10 @@ async function processAgentConversation(
           );
         }
       }
+
+      // Reset idle timer on stream events so long-running tool calls
+      // don't get killed while the agent is actively working.
+      resetIdleTimer();
       return;
     }
 
