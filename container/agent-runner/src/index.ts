@@ -1067,6 +1067,7 @@ async function runQuery(
     prompt: stream,
     options: {
       model: CLAUDE_MODEL,
+      betas: ['context-1m-2025-08-07'],
       cwd: WORKSPACE_GROUP,
       additionalDirectories: extraDirs,
       resume: sessionId,
