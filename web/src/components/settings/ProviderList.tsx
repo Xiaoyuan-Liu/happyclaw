@@ -11,7 +11,7 @@ import {
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
-import { ToggleSwitch } from '@/components/ui/toggle-switch';
+import { Switch } from '@/components/ui/switch';
 import type { ProviderWithHealth, ProviderHealthStatus } from './types';
 
 interface ProviderListProps {
@@ -157,10 +157,10 @@ export function ProviderList({
                     </div>
 
                     <div className="flex items-center gap-1.5 shrink-0">
-                      <ToggleSwitch
+                      <Switch
                         checked={provider.enabled}
                         disabled={disabled || toggling || deleting}
-                        onChange={() => onToggle(provider)}
+                        onCheckedChange={() => onToggle(provider)}
                         aria-label={provider.enabled ? '禁用提供商' : '启用提供商'}
                       />
                       {health && !health.healthy && provider.enabled && (

@@ -3,7 +3,7 @@ import { Loader2, LogOut, QrCode, Shield, Smartphone } from 'lucide-react';
 import { toast } from 'sonner';
 
 import { Button } from '@/components/ui/button';
-import { ToggleSwitch } from '@/components/ui/toggle-switch';
+import { Switch } from '@/components/ui/switch';
 import { api } from '../../api/client';
 import { getErrorMessage } from './types';
 import { WeChatQRDialog } from './WeChatQRDialog';
@@ -102,7 +102,7 @@ export function WeChatChannelCard() {
               <p className="text-xs text-muted-foreground mt-0.5">通过微信 iLink Bot 接收和回复消息</p>
             </div>
           </div>
-          <ToggleSwitch checked={enabled} disabled={loading || toggling} onChange={handleToggle} />
+          <Switch checked={enabled} disabled={loading || toggling} onCheckedChange={handleToggle} />
         </div>
 
         <div className={`px-5 py-4 space-y-4 transition-opacity ${!enabled ? 'opacity-50 pointer-events-none' : ''}`}>
@@ -179,10 +179,10 @@ export function WeChatChannelCard() {
                     </p>
                   </div>
                 </div>
-                <ToggleSwitch
+                <Switch
                   checked={bypassProxy}
                   disabled={togglingProxy}
-                  onChange={handleBypassProxyToggle}
+                  onCheckedChange={handleBypassProxyToggle}
                 />
               </div>
             </>
