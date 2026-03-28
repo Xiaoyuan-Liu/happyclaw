@@ -331,11 +331,11 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
                   }}
                 >
                   <div className="flex items-center gap-3 my-6 px-4">
-                    <div className="flex-1 border-t border-amber-300" />
-                    <span className="text-xs text-amber-600 whitespace-pre-wrap">
+                    <div className="flex-1 border-t border-amber-300 dark:border-amber-700" />
+                    <span className="text-xs text-amber-600 dark:text-amber-400 whitespace-pre-wrap">
                       {item.content}
                     </span>
-                    <div className="flex-1 border-t border-amber-300" />
+                    <div className="flex-1 border-t border-amber-300 dark:border-amber-700" />
                   </div>
                 </div>
               );
@@ -382,12 +382,12 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
                   }}
                 >
                   <div className="flex items-center gap-3 my-6 px-4">
-                    <div className="flex-1 border-t border-red-300" />
-                    <span className="text-xs text-red-600 whitespace-pre-wrap flex items-center gap-1">
+                    <div className="flex-1 border-t border-red-300 dark:border-red-800" />
+                    <span className="text-xs text-red-600 dark:text-red-400 whitespace-pre-wrap flex items-center gap-1">
                       <AlertTriangle size={14} />
                       {item.content}
                     </span>
-                    <div className="flex-1 border-t border-red-300" />
+                    <div className="flex-1 border-t border-red-300 dark:border-red-800" />
                   </div>
                 </div>
               );
@@ -477,7 +477,7 @@ export function MessageList({ messages, loading, hasMore, onLoadMore, scrollTrig
           <button
             type="button"
             onClick={onInterrupt}
-            className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs text-muted-foreground hover:text-red-600 bg-card/90 backdrop-blur-sm hover:bg-red-50 rounded-full border border-border shadow-sm transition-colors cursor-pointer"
+            className="inline-flex items-center gap-1.5 px-4 py-1.5 text-xs text-muted-foreground hover:text-red-600 dark:hover:text-red-400 bg-card/90 backdrop-blur-sm hover:bg-red-50 dark:hover:bg-red-950/30 rounded-full border border-border shadow-sm transition-colors cursor-pointer"
           >
             <Square className="w-3 h-3" />
             中断
