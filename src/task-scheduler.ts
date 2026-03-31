@@ -600,6 +600,53 @@ async function runScriptTask(
   updateTaskAfterRun(task.id, nextRun, resultSummary);
 }
 
+/**
+ * GROUP MODE: inject the task prompt as a user message into the source workspace.
+ * The message will be processed by the existing container/process for that group,
+ * sharing its session, skills, and conversation history.
+ */
+function runGroupModeTask(
+  task: ScheduledTask,
+  deps: SchedulerDependencies,
+  targetGroupJid: string,
+  manualRun = false,
+): void {
+  const startTime = Date.now();
+  const owner = task.created_by ? getUserById(task.created_by) : null;
+  const senderName = owner?.display_name || owner?.username || '定时任务';
+
+  logger.info(
+    { taskId: task.id, targetGroupJid, groupFolder: task.group_folder },
+    'Running group-mode task: injecting prompt into source workspace',
+  );
+
+  // Store prompt as a user message in the source chat
+  if (deps.storePromptMessage) {
+    deps.storePromptMessage(
+      targetGroupJid,
+      owner?.id || 'system',
+      senderName,
+      task.prompt,
+    );
+  }
+
+  // Trigger message processing for the source workspace
+  deps.queue.enqueueMessageCheck(targetGroupJid);
+
+  // Log task run — actual execution is tracked as normal message processing
+  logTaskRun({
+    task_id: task.id,
+    run_at: new Date().toISOString(),
+    duration_ms: Date.now() - startTime,
+    status: 'success',
+    result: '已注入到源工作区',
+    error: null,
+  });
+
+  const nextRun = manualRun ? task.next_run : computeNextRun(task);
+  updateTaskAfterRun(task.id, nextRun, '已注入到源工作区');
+}
+
 let schedulerRunning = false;
 const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 let lastCleanupTime = 0;
@@ -679,9 +726,13 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
               'Unhandled error in runScriptTask',
             );
           });
+        } else if (currentTask.context_mode === 'group') {
+          // GROUP MODE: inject prompt as a message into the source workspace.
+          // The task runs inside the existing group's container/process,
+          // sharing its session, skills, and conversation history.
+          runGroupModeTask(currentTask, deps, targetGroupJid);
         } else {
-          // Each agent task has a dedicated workspace; use workspace JID or
-          // fallback to targetGroupJid for queue serialization key
+          // ISOLATED MODE (default): each task gets a dedicated workspace
           const taskQueueJid = currentTask.workspace_jid
             ? `${currentTask.workspace_jid}#task:${currentTask.id}`
             : `${targetGroupJid}#task:${currentTask.id}`;
@@ -728,6 +779,8 @@ export function triggerTaskNow(
     runScriptTask(task, deps, targetGroupJid, true).catch((err) =>
       logger.error({ taskId, err }, 'Manual script task failed'),
     );
+  } else if (task.context_mode === 'group') {
+    runGroupModeTask(task, deps, targetGroupJid, true);
   } else {
     const opts: RunTaskOptions = { manualRun: true, taskRunId: task.id };
     const taskQueueJid = task.workspace_jid
