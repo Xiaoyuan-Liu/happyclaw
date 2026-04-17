@@ -1503,7 +1503,7 @@ async function runQuery(
       if (textResult && isInvalidThinkingSignatureError(textResult)) {
         log(`Invalid thinking signature in result: ${textResult.slice(0, 200)}`);
         processor.resetFullTextAccumulator();
-        return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, sessionResumeFailed: true };
+        return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, sessionResumeFailed: true, pipedMessagesDuringQuery };
       }
 
       const { effectiveResult } = processor.processResult(textResult);
@@ -1613,7 +1613,7 @@ async function runQuery(
     // 检测会话历史中 thinking block signature 无效（SDK/API 升级后旧会话不兼容）
     if (isInvalidThinkingSignatureError(errorMessage)) {
       log(`Invalid thinking signature detected, treating as session resume failure: ${errorMessage}`);
-      return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, sessionResumeFailed: true };
+      return { newSessionId, lastAssistantUuid, closedDuringQuery, interruptedDuringQuery, sessionResumeFailed: true, pipedMessagesDuringQuery };
     }
 
     // 中断导致的 SDK 错误（error_during_execution 等）：正常返回，不抛出

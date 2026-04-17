@@ -1876,7 +1876,7 @@ interface BtwResult {
  * and broadcasts `btw_response` to Web clients with streaming updates.
  * Returns BtwResult with the final answer text and whether the card handled delivery.
  */
-function streamBtwAnswer(
+async function streamBtwAnswer(
   chatJid: string,
   question: string,
   transcript: string,
@@ -1884,22 +1884,22 @@ function streamBtwAnswer(
   const btwId = crypto.randomUUID();
   const prompt = BTW_PROMPT_TEMPLATE(transcript, question);
 
+  // Create streaming card for Feishu (no-op for non-Feishu channels)
+  const makeOnCardCreated = (jid: string) => (messageId: string) =>
+    registerMessageIdMapping(messageId, jid);
+  const streamingSession = await imManager.createStreamingSession(
+    chatJid,
+    makeOnCardCreated(chatJid),
+  );
+  if (streamingSession) {
+    registerStreamingSession(chatJid, streamingSession);
+    streamingSession.setThinking();
+  }
+
   return new Promise((resolve) => {
     const model = process.env.RECALL_MODEL || '';
     const args = ['--print', '--output-format', 'stream-json', '--verbose'];
     if (model) args.push('--model', model);
-
-    // Create streaming card for Feishu (no-op for non-Feishu channels)
-    const makeOnCardCreated = (jid: string) => (messageId: string) =>
-      registerMessageIdMapping(messageId, jid);
-    const streamingSession = imManager.createStreamingSession(
-      chatJid,
-      makeOnCardCreated(chatJid),
-    );
-    if (streamingSession) {
-      registerStreamingSession(chatJid, streamingSession);
-      streamingSession.setThinking();
-    }
 
     let accumulatedText = '';
     let lastBroadcastLen = 0;
@@ -1973,7 +1973,10 @@ function streamBtwAnswer(
           logger.debug({ err, chatJid }, 'btw streaming card finalize failed');
         }
       }
-      sentViaCard = streamingSession?.currentState === 'completed';
+      sentViaCard =
+        !!streamingSession &&
+        'currentState' in streamingSession &&
+        streamingSession.currentState === 'completed';
       unregisterStreamingSession(chatJid);
 
       // Send final broadcast
