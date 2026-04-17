@@ -65,3 +65,6 @@ Thumbs.db
 
 /log/
 nohup.out
+
+# Local automation scripts (contain machine-specific paths)
+scripts/daily-update.sh
