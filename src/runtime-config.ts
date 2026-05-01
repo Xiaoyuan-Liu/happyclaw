@@ -60,6 +60,10 @@ const RESERVED_CLAUDE_ENV_KEYS = new Set([
   'ANTHROPIC_VERTEX_BASE_URL',
   'ANTHROPIC_FOUNDRY_BASE_URL',
   'ANTHROPIC_FOUNDRY_API_KEY',
+  // Compatibility flags for non-Anthropic upstreams (GLM/Minimax/etc adapters)
+  // — see buildClaudeEnvLines for rationale.
+  'ENABLE_TOOL_SEARCH',
+  'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS',
   // Telemetry tag identifying HappyClaw as the SDK client app
   'CLAUDE_AGENT_SDK_CLIENT_APP',
 ]);
@@ -2889,6 +2893,17 @@ export function buildClaudeEnvLines(
   // Inject SDK client-app telemetry tag for every backend. The key is reserved
   // (RESERVED_CLAUDE_ENV_KEYS) so customEnv cannot shadow or duplicate it.
   lines.push('CLAUDE_AGENT_SDK_CLIENT_APP=happyclaw');
+
+  // Non-official backends (anthropic_messages 兼容网关 / Bedrock / Vertex /
+  // Foundry) often run upstream services that don't recognize Claude Code 的
+  // 实验性 beta header（典型如 GLM 官方 Anthropic 兼容端点会返回
+  // `code:1210 "API 调用参数有误"`）。GLM 官方文档明示这两个 env 可以让
+  // SDK 关闭 tool-search + 实验 beta，规避 400。我们对所有非 official 后端
+  // 默认注入；若上游能正常接受 beta 也无副作用（属于"关掉本来就该关的"）。
+  if (backend !== 'anthropic_official') {
+    lines.push('ENABLE_TOOL_SEARCH=0');
+    lines.push('CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1');
+  }
 
   if (backend === 'anthropic_official') {
     // When full OAuth credentials exist, authentication is handled by .credentials.json file.

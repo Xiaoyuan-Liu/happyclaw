@@ -73,12 +73,13 @@ describe('buildClaudeEnvLines', () => {
 
     expect(lines).toEqual([
       'CLAUDE_AGENT_SDK_CLIENT_APP=happyclaw',
+      'ENABLE_TOOL_SEARCH=0',
+      'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1',
       'ANTHROPIC_BASE_URL=https://gateway.example.com',
       'ANTHROPIC_API_KEY=third-party-token',
       'ANTHROPIC_MODEL=claude-compatible-model',
     ]);
     expect(lines).not.toContain('ANTHROPIC_AUTH_TOKEN=third-party-token');
-    expect(lines).not.toContain('CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1');
   });
 
   test('adds experimental beta opt-out for anthropic messages backend when enabled', async () => {
@@ -116,6 +117,8 @@ describe('buildClaudeEnvLines', () => {
 
     expect(lines).toEqual([
       'CLAUDE_AGENT_SDK_CLIENT_APP=happyclaw',
+      'ENABLE_TOOL_SEARCH=0',
+      'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1',
       'ANTHROPIC_AUTH_TOKEN=third-party-token',
       'ANTHROPIC_MODEL=claude-compatible-model',
     ]);
