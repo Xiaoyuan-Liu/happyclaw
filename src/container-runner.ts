@@ -29,6 +29,9 @@ import {
   getEffectiveExternalDir,
   mergeClaudeEnvConfig,
   resolveProviderById,
+  envLinesToRecord,
+  shouldStripClaudeOAuthArtifacts,
+  shouldStripInheritedAnthropicAuthToken,
   shellQuoteEnvLines,
   writeCredentialsFile,
 } from './runtime-config.js';
@@ -238,6 +241,22 @@ function mkdirForContainer(dirPath: string): void {
 interface ResolvedProvider {
   config: ClaudeProviderConfig;
   customEnv: Record<string, string>;
+}
+
+function shouldStripOAuthArtifacts(config: ClaudeProviderConfig): boolean {
+  return config.backend !== undefined
+    ? shouldStripClaudeOAuthArtifacts(config.backend)
+    : !!config.anthropicBaseUrl;
+}
+
+function shouldStripInheritedAuthToken(
+  config: ClaudeProviderConfig,
+  generatedEnv: Record<string, string>,
+): boolean {
+  return config.backend !== undefined
+    ? shouldStripInheritedAnthropicAuthToken(config.backend, generatedEnv)
+    : !!generatedEnv['ANTHROPIC_BASE_URL'] &&
+        generatedEnv.ANTHROPIC_AUTH_TOKEN === undefined;
 }
 
 /**
@@ -586,7 +605,7 @@ function buildVolumeMounts(
 
   // Third-party provider: remove any stale .credentials.json so the SDK
   // does not detect OAuth credentials from a previous official-provider run.
-  if (mergedConfig.anthropicBaseUrl) {
+  if (shouldStripOAuthArtifacts(mergedConfig)) {
     try {
       const staleCreds = path.join(groupSessionsDir, '.credentials.json');
       if (fs.existsSync(staleCreds)) fs.unlinkSync(staleCreds);
@@ -1293,20 +1312,24 @@ export async function runHostAgent(
       containerOverride,
       hostPoolResult?.resolved.customEnv,
     );
-    for (const line of envLines) {
-      const eqIdx = line.indexOf('=');
-      if (eqIdx > 0) {
-        hostEnv[line.slice(0, eqIdx)] = line.slice(eqIdx + 1);
-      }
+    const generatedEnv = envLinesToRecord(envLines);
+    for (const [key, value] of Object.entries(generatedEnv)) {
+      hostEnv[key] = value;
     }
 
-    // Third-party provider: ANTHROPIC_AUTH_TOKEN inherited from the host
-    // (~/.claude/settings.json) forces the SDK down the OAuth code path,
-    // which skips the standard Bearer header and causes 404 on non-Anthropic
-    // endpoints. Unset it so the injected ANTHROPIC_API_KEY takes effect.
-    if (hostEnv['ANTHROPIC_BASE_URL']) {
-      delete hostEnv['ANTHROPIC_AUTH_TOKEN'];
+    const mergedConfig = mergeClaudeEnvConfig(globalConfig, containerOverride);
+    const stripInheritedAnthropicAuthToken =
+      shouldStripInheritedAuthToken(mergedConfig, generatedEnv);
+    const stripHostOAuthArtifacts = shouldStripOAuthArtifacts(mergedConfig);
 
+    // Third-party provider: ANTHROPIC_AUTH_TOKEN inherited from the host
+    // (~/.claude/settings.json) can force the SDK down the OAuth code path.
+    // Only remove inherited tokens; keep values generated for this run.
+    if (stripInheritedAnthropicAuthToken) {
+      delete hostEnv['ANTHROPIC_AUTH_TOKEN'];
+    }
+
+    if (stripHostOAuthArtifacts) {
       // Also strip oauthAccount from session .claude.json: the SDK detects
       // OAuth credentials in .claude.json and takes the OAuth code path even
       // when ANTHROPIC_AUTH_TOKEN is absent. This causes the same 404 on
@@ -1342,7 +1365,6 @@ export async function runHostAgent(
     }
 
     // Write .credentials.json for OAuth credentials
-    const mergedConfig = mergeClaudeEnvConfig(globalConfig, containerOverride);
     if (mergedConfig.claudeOAuthCredentials) {
       try {
         writeCredentialsFile(groupSessionsDir, mergedConfig);

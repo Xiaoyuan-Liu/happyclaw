@@ -626,10 +626,22 @@ export const BugReportSubmitSchema = z.object({
 
 // ─── 统一供应商 (V4) ────────────────────────────────────────
 
+export const ProviderBackendSchema = z.enum([
+  'anthropic_official',
+  'anthropic_messages',
+  'bedrock',
+  'bedrock_gateway',
+  'vertex',
+  'vertex_gateway',
+  'foundry',
+]);
+
 export const UnifiedProviderCreateSchema = z
   .object({
     name: z.string().min(1).max(64),
     type: z.enum(['official', 'third_party']),
+    backend: ProviderBackendSchema.optional(),
+    disableExperimentalBetas: z.boolean().optional(),
     anthropicBaseUrl: z.string().max(2000).optional(),
     anthropicAuthToken: z.string().max(2000).optional(),
     anthropicModel: z.string().max(128).optional(),
@@ -652,11 +664,19 @@ export const UnifiedProviderCreateSchema = z
         message: '第三方供应商需要提供 Base URL 或 Auth Token',
       });
     }
-  });
+  })
+  .transform((data) => ({
+    ...data,
+    backend:
+      data.backend ??
+      (data.type === 'official' ? 'anthropic_official' : 'anthropic_messages'),
+  }));
 
 export const UnifiedProviderPatchSchema = z
   .object({
     name: z.string().min(1).max(64).optional(),
+    backend: ProviderBackendSchema.optional(),
+    disableExperimentalBetas: z.boolean().optional(),
     anthropicBaseUrl: z.string().max(2000).optional(),
     anthropicModel: z.string().max(128).optional(),
     customEnv: z.record(z.string().max(256), z.string().max(4096)).optional(),
@@ -665,6 +685,8 @@ export const UnifiedProviderPatchSchema = z
   .refine(
     (data) =>
       data.name !== undefined ||
+      data.backend !== undefined ||
+      data.disableExperimentalBetas !== undefined ||
       data.anthropicBaseUrl !== undefined ||
       data.anthropicModel !== undefined ||
       data.customEnv !== undefined ||

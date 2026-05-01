@@ -7,7 +7,18 @@ import { ASSISTANT_NAME, DATA_DIR } from './config.js';
 import { logger } from './logger.js';
 
 const MAX_FIELD_LENGTH = 2000;
-const CURRENT_CONFIG_VERSION = 3;
+/**
+ * Legacy V3 config writer keeps writing version=3 for back-compat with the old
+ * `writeStoredState()` path. Do NOT bump this constant when introducing a new
+ * schema — instead add a new VERSION constant and a new writer.
+ */
+const LEGACY_CONFIG_VERSION_V3 = 3;
+/**
+ * Current unified provider config schema version. V5 introduced an explicit
+ * `backend` field on each provider so we can dispatch env generation per
+ * Anthropic / Bedrock / Vertex / Foundry instead of guessing from baseURL.
+ */
+const UNIFIED_PROVIDER_CONFIG_VERSION = 5;
 const DEFAULT_THIRD_PARTY_PROFILE_ID = 'default';
 const DEFAULT_THIRD_PARTY_PROFILE_NAME = '默认第三方';
 const OFFICIAL_CLAUDE_PROFILE_ID = '__official__';
@@ -123,6 +134,8 @@ export interface CachedOAuthUsage {
 }
 
 export interface ClaudeProviderConfig {
+  backend?: ProviderBackend;
+  disableExperimentalBetas?: boolean;
   anthropicBaseUrl: string;
   anthropicAuthToken: string;
   anthropicApiKey: string;
@@ -328,11 +341,62 @@ interface StoredClaudeProviderConfigV4 {
   updatedAt: string;
 }
 
+/**
+ * Provider backend kind. Used to decide which Claude Agent SDK code path the
+ * runtime should activate (Anthropic Messages / Bedrock / Vertex / Foundry).
+ * V4 only had `type: official | third_party` which conflated several real
+ * backends behind `third_party`.
+ */
+export type ProviderBackend =
+  | 'anthropic_official'
+  | 'anthropic_messages'
+  | 'bedrock'
+  | 'bedrock_gateway'
+  | 'vertex'
+  | 'vertex_gateway'
+  | 'foundry';
+
+/** V5 磁盘格式 — V4 + 显式 backend 字段 */
+interface StoredProviderV5 {
+  id: string;
+  name: string;
+  type: 'official' | 'third_party';
+  /** New in V5. Controls env builder dispatch. */
+  backend: ProviderBackend;
+  /** New in V5. When true, inject CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1. */
+  disableExperimentalBetas?: boolean;
+  enabled: boolean;
+  weight: number;
+  anthropicBaseUrl: string;
+  anthropicModel: string;
+  secrets: EncryptedSecrets;
+  customEnv?: Record<string, string>;
+  updatedAt: string;
+}
+
+interface StoredClaudeProviderConfigV5 {
+  version: 5;
+  providers: StoredProviderV5[];
+  balancing: BalancingConfig;
+  updatedAt: string;
+}
+
 /** 解密后的统一供应商运行时结构 */
 export interface UnifiedProvider {
   id: string;
   name: string;
   type: 'official' | 'third_party';
+  /**
+   * Backend kind. Always set in-memory (V4 → V5 migration fills it from
+   * `type`). Drives env injection in `buildClaudeEnvLines`.
+   */
+  backend: ProviderBackend;
+  /**
+   * Optional. When `true`, the runtime injects
+   * `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`. V4 → V5 migration leaves this
+   * `undefined` so behavior of legacy configs is preserved bit-for-bit.
+   */
+  disableExperimentalBetas?: boolean;
   enabled: boolean;
   weight: number;
   anthropicBaseUrl: string;
@@ -350,6 +414,8 @@ export interface UnifiedProviderPublic {
   id: string;
   name: string;
   type: 'official' | 'third_party';
+  backend: ProviderBackend;
+  disableExperimentalBetas?: boolean;
   enabled: boolean;
   weight: number;
   anthropicBaseUrl: string;
@@ -365,6 +431,17 @@ export interface UnifiedProviderPublic {
   claudeOAuthCredentialsAccessTokenMasked: string | null;
   customEnv: Record<string, string>;
   updatedAt: string;
+}
+
+/**
+ * Default backend inferred from the legacy V4 `type` field. Used during
+ * V4 → V5 migration and as a fallback when callers omit `backend` from a
+ * create/patch request (preserves V4 API behavior for existing UIs).
+ */
+export function defaultBackendForType(
+  type: 'official' | 'third_party',
+): ProviderBackend {
+  return type === 'official' ? 'anthropic_official' : 'anthropic_messages';
 }
 
 const MAX_PROVIDERS = 20;
@@ -517,6 +594,10 @@ function normalizeConfig(
   input: Omit<ClaudeProviderConfig, 'updatedAt'>,
 ): Omit<ClaudeProviderConfig, 'updatedAt'> {
   return {
+    ...(input.backend !== undefined ? { backend: input.backend } : {}),
+    ...(input.disableExperimentalBetas !== undefined
+      ? { disableExperimentalBetas: input.disableExperimentalBetas }
+      : {}),
     anthropicBaseUrl: normalizeBaseUrl(input.anthropicBaseUrl),
     anthropicAuthToken: normalizeSecret(
       input.anthropicAuthToken,
@@ -662,6 +743,7 @@ function readLegacyConfig(
 ): ClaudeProviderConfig {
   return buildConfig(
     {
+      backend: defaultBackendForType('third_party'),
       anthropicBaseUrl: raw.anthropicBaseUrl ?? '',
       anthropicAuthToken: raw.anthropicAuthToken ?? '',
       anthropicApiKey: raw.anthropicApiKey ?? '',
@@ -760,6 +842,7 @@ function buildOfficialClaudeProviderConfig(
 ): ClaudeProviderConfig {
   return buildConfig(
     {
+      backend: defaultBackendForType('official'),
       anthropicBaseUrl: '',
       anthropicAuthToken: '',
       anthropicApiKey: officialSecrets.anthropicApiKey,
@@ -872,6 +955,56 @@ function normalizeStoredState(
   };
 }
 
+function unifiedProvidersToStoredStateV3(
+  providers: UnifiedProvider[],
+): ClaudeStoredStateV3Resolved {
+  const enabled = providers.find((p) => p.enabled) || providers[0];
+  const official =
+    providers.find((p) => p.type === 'official' && p.enabled) ||
+    providers.find((p) => p.type === 'official');
+  const profiles = providers
+    .filter((p) => p.type === 'third_party')
+    .slice(0, MAX_THIRD_PARTY_PROFILES)
+    .map((provider) =>
+      toStoredProfile({
+        id: provider.id,
+        name: provider.name,
+        anthropicBaseUrl: provider.anthropicBaseUrl,
+        anthropicAuthToken: provider.anthropicAuthToken,
+        anthropicModel: provider.anthropicModel,
+        updatedAt: provider.updatedAt,
+        customEnv: provider.customEnv || {},
+      }),
+    );
+
+  const activeProfileId =
+    enabled?.type === 'official'
+      ? OFFICIAL_CLAUDE_PROFILE_ID
+      : enabled?.type === 'third_party'
+        ? normalizeProfileId(enabled.id)
+        : profiles[0]?.id || OFFICIAL_CLAUDE_PROFILE_ID;
+
+  return normalizeStoredState({
+    activeProfileId,
+    profiles,
+    officialSecrets: official
+      ? {
+          anthropicAuthToken: '',
+          anthropicApiKey: official.anthropicApiKey,
+          claudeCodeOauthToken: official.claudeCodeOauthToken,
+          claudeOAuthCredentials: official.claudeOAuthCredentials ?? null,
+        }
+      : {
+          anthropicAuthToken: '',
+          anthropicApiKey: '',
+          claudeCodeOauthToken: '',
+          claudeOAuthCredentials: null,
+        },
+    officialUpdatedAt: official?.updatedAt || null,
+    officialCustomEnv: official?.customEnv || {},
+  });
+}
+
 function readStoredState(): ClaudeStoredStateV3Resolved | null {
   if (!fs.existsSync(CLAUDE_CONFIG_FILE)) return null;
   try {
@@ -901,6 +1034,20 @@ function readStoredState(): ClaudeStoredStateV3Resolved | null {
         officialUpdatedAt: v3.official?.updatedAt || null,
         officialCustomEnv: v3.official?.customEnv || {},
       });
+    }
+
+    if (parsed.version === 4) {
+      const v4 = parsed as unknown as StoredClaudeProviderConfigV4;
+      return unifiedProvidersToStoredStateV3(
+        v4.providers.map(fromStoredProviderV4),
+      );
+    }
+
+    if (parsed.version === UNIFIED_PROVIDER_CONFIG_VERSION) {
+      const v5 = parsed as unknown as StoredClaudeProviderConfigV5;
+      return unifiedProvidersToStoredStateV3(
+        v5.providers.map(fromStoredProviderV5),
+      );
     }
 
     if (parsed.version === 2) {
@@ -957,10 +1104,30 @@ function readStoredState(): ClaudeStoredStateV3Resolved | null {
   }
 }
 
+function hasUnifiedProviderConfigOnDisk(): boolean {
+  if (!fs.existsSync(CLAUDE_CONFIG_FILE)) return false;
+  try {
+    const parsed = JSON.parse(
+      fs.readFileSync(CLAUDE_CONFIG_FILE, 'utf-8'),
+    ) as Record<string, unknown>;
+    return (
+      parsed.version === 4 || parsed.version === UNIFIED_PROVIDER_CONFIG_VERSION
+    );
+  } catch {
+    return false;
+  }
+}
+
 function writeStoredState(state: ClaudeStoredStateV3Resolved): void {
+  if (hasUnifiedProviderConfigOnDisk()) {
+    throw new Error(
+      '旧版 Claude 配置写入接口不能覆盖统一供应商配置，请使用 /claude/providers API',
+    );
+  }
+
   const normalized = normalizeStoredState(state);
   const payload: StoredClaudeProviderConfigV3 = {
-    version: CURRENT_CONFIG_VERSION,
+    version: LEGACY_CONFIG_VERSION_V3,
     activeProfileId: normalized.activeProfileId,
     profiles: normalized.profiles,
     official: {
@@ -1018,6 +1185,7 @@ function fromStoredProviderV4(stored: StoredProviderV4): UnifiedProvider {
     id: stored.id,
     name: stored.name,
     type: stored.type,
+    backend: defaultBackendForType(stored.type),
     enabled: stored.enabled,
     weight: Math.max(1, Math.min(100, stored.weight || 1)),
     anthropicBaseUrl: stored.anthropicBaseUrl || '',
@@ -1030,6 +1198,115 @@ function fromStoredProviderV4(stored: StoredProviderV4): UnifiedProvider {
       skipReservedClaudeKeys: true,
     }),
     updatedAt: stored.updatedAt || '',
+  };
+}
+
+// ─── V5 helpers ──────────────────────────────────────────────────
+
+function isProviderBackend(value: unknown): value is ProviderBackend {
+  return (
+    value === 'anthropic_official' ||
+    value === 'anthropic_messages' ||
+    value === 'bedrock' ||
+    value === 'bedrock_gateway' ||
+    value === 'vertex' ||
+    value === 'vertex_gateway' ||
+    value === 'foundry'
+  );
+}
+
+function toStoredProviderV5(provider: UnifiedProvider): StoredProviderV5 {
+  const secrets: SecretPayload = {
+    anthropicAuthToken: provider.anthropicAuthToken || '',
+    anthropicApiKey: provider.anthropicApiKey || '',
+    claudeCodeOauthToken: provider.claudeCodeOauthToken || '',
+    claudeOAuthCredentials: provider.claudeOAuthCredentials ?? null,
+  };
+  const sanitizedEnv = sanitizeCustomEnvMap(provider.customEnv || {}, {
+    skipReservedClaudeKeys: true,
+  });
+  return {
+    id: provider.id,
+    name: provider.name,
+    type: provider.type,
+    backend: provider.backend ?? defaultBackendForType(provider.type),
+    ...(provider.disableExperimentalBetas !== undefined
+      ? { disableExperimentalBetas: provider.disableExperimentalBetas }
+      : {}),
+    enabled: provider.enabled,
+    weight: Math.max(1, Math.min(100, provider.weight || 1)),
+    anthropicBaseUrl: provider.anthropicBaseUrl || '',
+    anthropicModel: provider.anthropicModel || '',
+    secrets: encryptSecrets(secrets),
+    ...(Object.keys(sanitizedEnv).length > 0
+      ? { customEnv: sanitizedEnv }
+      : {}),
+    updatedAt: provider.updatedAt || new Date().toISOString(),
+  };
+}
+
+function fromStoredProviderV5(stored: StoredProviderV5): UnifiedProvider {
+  const secrets = decryptSecrets(stored.secrets);
+  // Defensive: if disk has an unknown backend string (forward-compat / corruption),
+  // fall back to the default for the provider's type rather than crashing.
+  const backend: ProviderBackend = isProviderBackend(stored.backend)
+    ? stored.backend
+    : defaultBackendForType(stored.type);
+  return {
+    id: stored.id,
+    name: stored.name,
+    type: stored.type,
+    backend,
+    ...(stored.disableExperimentalBetas !== undefined
+      ? { disableExperimentalBetas: stored.disableExperimentalBetas }
+      : {}),
+    enabled: stored.enabled,
+    weight: Math.max(1, Math.min(100, stored.weight || 1)),
+    anthropicBaseUrl: stored.anthropicBaseUrl || '',
+    anthropicAuthToken: secrets.anthropicAuthToken || '',
+    anthropicModel: stored.anthropicModel || '',
+    anthropicApiKey: secrets.anthropicApiKey || '',
+    claudeCodeOauthToken: secrets.claudeCodeOauthToken || '',
+    claudeOAuthCredentials: secrets.claudeOAuthCredentials ?? null,
+    customEnv: sanitizeCustomEnvMap(stored.customEnv || {}, {
+      skipReservedClaudeKeys: true,
+    }),
+    updatedAt: stored.updatedAt || '',
+  };
+}
+
+/**
+ * Migrate a parsed V4 stored payload to V5 *without* re-encrypting secrets.
+ *
+ * Critical invariant: the encrypted `secrets` blob is passed through byte-for-
+ * byte (same iv/tag/data). Re-encrypting would generate a new IV on every
+ * migration, which is wasteful and would invalidate any external diff/audit
+ * tooling that diff'd the on-disk file.
+ */
+function migrateV4toV5(
+  v4: StoredClaudeProviderConfigV4,
+): StoredClaudeProviderConfigV5 {
+  const providers: StoredProviderV5[] = v4.providers.map((p) => ({
+    id: p.id,
+    name: p.name,
+    type: p.type,
+    backend: defaultBackendForType(p.type),
+    // Intentionally leave `disableExperimentalBetas` undefined for legacy
+    // configs — auto-enabling it would change runtime behavior, which this
+    // schema migration must not do.
+    enabled: p.enabled,
+    weight: p.weight,
+    anthropicBaseUrl: p.anthropicBaseUrl,
+    anthropicModel: p.anthropicModel,
+    secrets: p.secrets, // pass-through, do NOT re-encrypt
+    ...(p.customEnv ? { customEnv: p.customEnv } : {}),
+    updatedAt: p.updatedAt,
+  }));
+  return {
+    version: 5,
+    providers,
+    balancing: v4.balancing,
+    updatedAt: new Date().toISOString(),
   };
 }
 
@@ -1051,6 +1328,7 @@ function migrateV3toV4(v3: ClaudeStoredStateV3Resolved): {
       id: OFFICIAL_CLAUDE_PROFILE_ID,
       name: '官方 Claude',
       type: 'official',
+      backend: defaultBackendForType('official'),
       enabled: isOfficialClaudeMode(v3.activeProfileId),
       weight: 1,
       anthropicBaseUrl: '',
@@ -1071,6 +1349,7 @@ function migrateV3toV4(v3: ClaudeStoredStateV3Resolved): {
       id: profile.id,
       name: profile.name,
       type: 'third_party',
+      backend: defaultBackendForType('third_party'),
       enabled: profile.id === v3.activeProfileId,
       weight: 1,
       anthropicBaseUrl: profile.anthropicBaseUrl,
@@ -1134,8 +1413,47 @@ function migrateV3toV4(v3: ClaudeStoredStateV3Resolved): {
   return { providers, balancing };
 }
 
-/** Read V4 config, with automatic V3→V4 migration */
-function readStoredStateV4(): {
+/**
+ * Hoist a V3 (or older) stored state up to V4 in-memory only. Used as a
+ * stepping stone by `readStoredStateV5()`; never writes V4 to disk on its own
+ * because V5 is the canonical writer now.
+ */
+function loadAsV4InMemory(): StoredClaudeProviderConfigV4 | null {
+  if (!fs.existsSync(CLAUDE_CONFIG_FILE)) return null;
+  try {
+    const content = fs.readFileSync(CLAUDE_CONFIG_FILE, 'utf-8');
+    const parsed = JSON.parse(content) as Record<string, unknown>;
+
+    if (parsed.version === 4) {
+      return parsed as unknown as StoredClaudeProviderConfigV4;
+    }
+
+    // V3 or older → read as V3, then migrate to V4 (in-memory)
+    const v3 = readStoredState();
+    if (!v3) return null;
+
+    const migrated = migrateV3toV4(v3);
+    return {
+      version: 4,
+      providers: migrated.providers.map(toStoredProviderV4),
+      balancing: migrated.balancing,
+      updatedAt: new Date().toISOString(),
+    };
+  } catch (err) {
+    logger.error(
+      { err, file: CLAUDE_CONFIG_FILE },
+      'Failed to read Claude provider config (V4 in-memory hoist)',
+    );
+    return null;
+  }
+}
+
+/**
+ * Read V5 config, with lazy V4→V5 (and transitively V3→V4→V5) migration.
+ * Public reads (`getProviders`, etc.) all funnel through this so callers
+ * always see V5 shape with the `backend` field populated.
+ */
+function readStoredStateV5(): {
   providers: UnifiedProvider[];
   balancing: BalancingConfig;
 } | null {
@@ -1144,66 +1462,84 @@ function readStoredStateV4(): {
     const content = fs.readFileSync(CLAUDE_CONFIG_FILE, 'utf-8');
     const parsed = JSON.parse(content) as Record<string, unknown>;
 
-    if (parsed.version === 4) {
-      const v4 = parsed as unknown as StoredClaudeProviderConfigV4;
+    if (parsed.version === UNIFIED_PROVIDER_CONFIG_VERSION) {
+      const v5 = parsed as unknown as StoredClaudeProviderConfigV5;
       return {
-        providers: v4.providers.map(fromStoredProviderV4),
+        providers: v5.providers.map(fromStoredProviderV5),
         balancing: {
-          strategy: v4.balancing?.strategy || DEFAULT_BALANCING_CONFIG.strategy,
+          strategy: v5.balancing?.strategy || DEFAULT_BALANCING_CONFIG.strategy,
           unhealthyThreshold:
-            v4.balancing?.unhealthyThreshold ??
+            v5.balancing?.unhealthyThreshold ??
             DEFAULT_BALANCING_CONFIG.unhealthyThreshold,
           recoveryIntervalMs:
-            v4.balancing?.recoveryIntervalMs ??
+            v5.balancing?.recoveryIntervalMs ??
             DEFAULT_BALANCING_CONFIG.recoveryIntervalMs,
         },
       };
     }
 
-    // V3 or older → read as V3, then migrate
-    const v3 = readStoredState();
-    if (!v3) return null;
+    // Older versions → hoist to V4 in memory, then V4→V5
+    const v4 = loadAsV4InMemory();
+    if (!v4) return null;
 
-    const migrated = migrateV3toV4(v3);
+    const v5 = migrateV4toV5(v4);
 
-    // Auto-save as V4 on first read (lazy migration)
-    writeStoredStateV4(migrated.providers, migrated.balancing);
+    // Lazy migration: persist V5 on first read
+    writeStoredStateV5Raw(v5);
     logger.info(
-      { providerCount: migrated.providers.length },
-      'Migrated Claude provider config from V3 to V4',
+      {
+        providerCount: v5.providers.length,
+        fromVersion: parsed.version,
+      },
+      'Migrated Claude provider config to V5',
     );
 
-    return migrated;
+    return {
+      providers: v5.providers.map(fromStoredProviderV5),
+      balancing: {
+        strategy: v5.balancing?.strategy || DEFAULT_BALANCING_CONFIG.strategy,
+        unhealthyThreshold:
+          v5.balancing?.unhealthyThreshold ??
+          DEFAULT_BALANCING_CONFIG.unhealthyThreshold,
+        recoveryIntervalMs:
+          v5.balancing?.recoveryIntervalMs ??
+          DEFAULT_BALANCING_CONFIG.recoveryIntervalMs,
+      },
+    };
   } catch (err) {
     logger.error(
       { err, file: CLAUDE_CONFIG_FILE },
-      'Failed to read Claude provider config V4',
+      'Failed to read Claude provider config V5',
     );
     return null;
   }
 }
 
-function writeStoredStateV4(
-  providers: UnifiedProvider[],
-  balancing: BalancingConfig,
-): void {
-  const payload: StoredClaudeProviderConfigV4 = {
-    version: 4,
-    providers: providers.map(toStoredProviderV4),
-    balancing,
-    updatedAt: new Date().toISOString(),
-  };
-
+/** Internal: persist a fully-built V5 payload (used by lazy-migration path). */
+function writeStoredStateV5Raw(payload: StoredClaudeProviderConfigV5): void {
   fs.mkdirSync(CLAUDE_CONFIG_DIR, { recursive: true });
   const tmp = `${CLAUDE_CONFIG_FILE}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + '\n', 'utf-8');
   fs.renameSync(tmp, CLAUDE_CONFIG_FILE);
 }
 
-// ─── V4 公开 API ─────────────────────────────────────────────
+function writeStoredStateV5(
+  providers: UnifiedProvider[],
+  balancing: BalancingConfig,
+): void {
+  const payload: StoredClaudeProviderConfigV5 = {
+    version: 5,
+    providers: providers.map(toStoredProviderV5),
+    balancing,
+    updatedAt: new Date().toISOString(),
+  };
+  writeStoredStateV5Raw(payload);
+}
+
+// ─── V5 公开 API ─────────────────────────────────────────────
 
 export function getProviders(): UnifiedProvider[] {
-  const state = readStoredStateV4();
+  const state = readStoredStateV5();
   return state?.providers ?? [];
 }
 
@@ -1212,14 +1548,14 @@ export function getEnabledProviders(): UnifiedProvider[] {
 }
 
 export function getBalancingConfig(): BalancingConfig {
-  const state = readStoredStateV4();
+  const state = readStoredStateV5();
   return state?.balancing ?? { ...DEFAULT_BALANCING_CONFIG };
 }
 
 export function saveBalancingConfig(
   config: Partial<BalancingConfig>,
 ): BalancingConfig {
-  const state = readStoredStateV4() || {
+  const state = readStoredStateV5() || {
     providers: [],
     balancing: { ...DEFAULT_BALANCING_CONFIG },
   };
@@ -1227,13 +1563,17 @@ export function saveBalancingConfig(
     ...state.balancing,
     ...config,
   };
-  writeStoredStateV4(state.providers, merged);
+  writeStoredStateV5(state.providers, merged);
   return merged;
 }
 
 export function createProvider(input: {
   name: string;
   type: 'official' | 'third_party';
+  /** New in V5. Defaults to `defaultBackendForType(type)` for back-compat. */
+  backend?: ProviderBackend;
+  /** New in V5. Optional explicit toggle for CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS. */
+  disableExperimentalBetas?: boolean;
   anthropicBaseUrl?: string;
   anthropicAuthToken?: string;
   anthropicModel?: string;
@@ -1244,7 +1584,7 @@ export function createProvider(input: {
   weight?: number;
   enabled?: boolean;
 }): UnifiedProvider {
-  const state = readStoredStateV4() || {
+  const state = readStoredStateV5() || {
     providers: [],
     balancing: { ...DEFAULT_BALANCING_CONFIG },
   };
@@ -1258,6 +1598,10 @@ export function createProvider(input: {
     id: crypto.randomBytes(8).toString('hex'),
     name: normalizeProfileName(input.name),
     type: input.type,
+    backend: input.backend ?? defaultBackendForType(input.type),
+    ...(input.disableExperimentalBetas !== undefined
+      ? { disableExperimentalBetas: input.disableExperimentalBetas }
+      : {}),
     enabled: input.enabled ?? state.providers.length === 0,
     weight: Math.max(1, Math.min(100, input.weight ?? 1)),
     anthropicBaseUrl: input.anthropicBaseUrl
@@ -1283,7 +1627,7 @@ export function createProvider(input: {
   };
 
   state.providers.push(provider);
-  writeStoredStateV4(state.providers, state.balancing);
+  writeStoredStateV5(state.providers, state.balancing);
   return provider;
 }
 
@@ -1291,13 +1635,17 @@ export function updateProvider(
   id: string,
   patch: {
     name?: string;
+    /** New in V5. Allows changing backend kind on an existing provider. */
+    backend?: ProviderBackend;
+    /** New in V5. Pass `false`/`undefined` to clear, `true` to enable. */
+    disableExperimentalBetas?: boolean;
     anthropicBaseUrl?: string;
     anthropicModel?: string;
     customEnv?: Record<string, string>;
     weight?: number;
   },
 ): UnifiedProvider {
-  const state = readStoredStateV4();
+  const state = readStoredStateV5();
   if (!state) throw new Error('Claude 配置不存在');
 
   const idx = state.providers.findIndex((p) => p.id === id);
@@ -1306,8 +1654,13 @@ export function updateProvider(
   const current = state.providers[idx];
   const updated: UnifiedProvider = {
     ...current,
+    backend:
+      patch.backend ?? current.backend ?? defaultBackendForType(current.type),
     ...(patch.name !== undefined
       ? { name: normalizeProfileName(patch.name) }
+      : {}),
+    ...(patch.disableExperimentalBetas !== undefined
+      ? { disableExperimentalBetas: patch.disableExperimentalBetas }
       : {}),
     ...(patch.anthropicBaseUrl !== undefined
       ? { anthropicBaseUrl: normalizeBaseUrl(patch.anthropicBaseUrl) }
@@ -1329,7 +1682,7 @@ export function updateProvider(
   };
 
   state.providers[idx] = updated;
-  writeStoredStateV4(state.providers, state.balancing);
+  writeStoredStateV5(state.providers, state.balancing);
   return updated;
 }
 
@@ -1346,7 +1699,7 @@ export function updateProviderSecrets(
     clearClaudeOAuthCredentials?: boolean;
   },
 ): UnifiedProvider {
-  const state = readStoredStateV4();
+  const state = readStoredStateV5();
   if (!state) throw new Error('Claude 配置不存在');
 
   const idx = state.providers.findIndex((p) => p.id === id);
@@ -1391,12 +1744,12 @@ export function updateProviderSecrets(
   }
 
   state.providers[idx] = updated;
-  writeStoredStateV4(state.providers, state.balancing);
+  writeStoredStateV5(state.providers, state.balancing);
   return updated;
 }
 
 export function toggleProvider(id: string): UnifiedProvider {
-  const state = readStoredStateV4();
+  const state = readStoredStateV5();
   if (!state) throw new Error('Claude 配置不存在');
 
   const idx = state.providers.findIndex((p) => p.id === id);
@@ -1415,12 +1768,12 @@ export function toggleProvider(id: string): UnifiedProvider {
     enabled: newEnabled,
     updatedAt: new Date().toISOString(),
   };
-  writeStoredStateV4(state.providers, state.balancing);
+  writeStoredStateV5(state.providers, state.balancing);
   return state.providers[idx];
 }
 
 export function deleteProvider(id: string): void {
-  const state = readStoredStateV4();
+  const state = readStoredStateV5();
   if (!state) throw new Error('Claude 配置不存在');
 
   const idx = state.providers.findIndex((p) => p.id === id);
@@ -1438,7 +1791,7 @@ export function deleteProvider(id: string): void {
     state.providers[0].enabled = true;
   }
 
-  writeStoredStateV4(state.providers, state.balancing);
+  writeStoredStateV5(state.providers, state.balancing);
 }
 
 /** Convert a UnifiedProvider to the flat ClaudeProviderConfig used by container runner */
@@ -1446,6 +1799,10 @@ export function providerToConfig(
   provider: UnifiedProvider,
 ): ClaudeProviderConfig {
   return {
+    backend: provider.backend ?? defaultBackendForType(provider.type),
+    ...(provider.disableExperimentalBetas !== undefined
+      ? { disableExperimentalBetas: provider.disableExperimentalBetas }
+      : {}),
     anthropicBaseUrl: provider.anthropicBaseUrl,
     anthropicAuthToken: provider.anthropicAuthToken,
     anthropicApiKey: provider.anthropicApiKey,
@@ -1464,6 +1821,10 @@ export function toPublicProvider(
     id: provider.id,
     name: provider.name,
     type: provider.type,
+    backend: provider.backend ?? defaultBackendForType(provider.type),
+    ...(provider.disableExperimentalBetas !== undefined
+      ? { disableExperimentalBetas: provider.disableExperimentalBetas }
+      : {}),
     enabled: provider.enabled,
     weight: provider.weight,
     anthropicBaseUrl: provider.anthropicBaseUrl,
@@ -1493,7 +1854,7 @@ export function resolveProviderById(providerId: string): {
   config: ClaudeProviderConfig;
   customEnv: Record<string, string>;
 } {
-  const state = readStoredStateV4();
+  const state = readStoredStateV5();
   if (!state) return { config: defaultsFromEnv(), customEnv: {} };
 
   const provider = state.providers.find((p) => p.id === providerId);
@@ -1565,6 +1926,7 @@ function readStoredConfig(): ClaudeProviderConfig | null {
 
   return buildConfig(
     {
+      backend: defaultBackendForType('third_party'),
       anthropicBaseUrl: resolved.profile.anthropicBaseUrl,
       anthropicAuthToken: resolved.profile.anthropicAuthToken,
       anthropicApiKey: resolved.officialSecrets.anthropicApiKey,
@@ -1579,6 +1941,9 @@ function readStoredConfig(): ClaudeProviderConfig | null {
 
 function defaultsFromEnv(): ClaudeProviderConfig {
   const raw = {
+    backend: process.env.ANTHROPIC_BASE_URL
+      ? defaultBackendForType('third_party')
+      : defaultBackendForType('official'),
     anthropicBaseUrl: process.env.ANTHROPIC_BASE_URL || '',
     anthropicAuthToken: process.env.ANTHROPIC_AUTH_TOKEN || '',
     anthropicApiKey: process.env.ANTHROPIC_API_KEY || '',
@@ -1591,6 +1956,7 @@ function defaultsFromEnv(): ClaudeProviderConfig {
     return buildConfig(raw, null);
   } catch {
     return {
+      backend: raw.backend,
       anthropicBaseUrl: '',
       anthropicAuthToken: raw.anthropicAuthToken.trim(),
       anthropicApiKey: raw.anthropicApiKey.trim(),
@@ -1848,7 +2214,7 @@ export function validateClaudeProviderConfig(
 
 export function getClaudeProviderConfig(): ClaudeProviderConfig {
   try {
-    const state = readStoredStateV4();
+    const state = readStoredStateV5();
     if (state) {
       const enabled =
         state.providers.find((p) => p.enabled) || state.providers[0];
@@ -1884,6 +2250,7 @@ export function saveClaudeProviderConfig(
         : [
             toStoredProfile(
               makeDefaultThirdPartyProfile({
+                backend: defaultBackendForType('third_party'),
                 anthropicBaseUrl: normalized.anthropicBaseUrl,
                 anthropicAuthToken: normalized.anthropicAuthToken,
                 anthropicApiKey: normalized.anthropicApiKey,
@@ -2309,39 +2676,66 @@ export function buildClaudeEnvLines(
   profileCustomEnv?: Record<string, string>,
 ): string[] {
   const lines: string[] = [];
+  const backend =
+    config.backend ??
+    (config.anthropicBaseUrl
+      ? defaultBackendForType('third_party')
+      : defaultBackendForType('official'));
 
-  // When full OAuth credentials exist, authentication is handled by .credentials.json file.
-  // Only fall back to CLAUDE_CODE_OAUTH_TOKEN env var for legacy single-token mode.
-  if (!config.claudeOAuthCredentials && config.claudeCodeOauthToken) {
-    lines.push(
-      `CLAUDE_CODE_OAUTH_TOKEN=${sanitizeEnvValue(config.claudeCodeOauthToken)}`,
-    );
-  }
-  if (config.anthropicApiKey) {
-    lines.push(`ANTHROPIC_API_KEY=${sanitizeEnvValue(config.anthropicApiKey)}`);
-  }
-  if (config.anthropicBaseUrl) {
-    lines.push(
-      `ANTHROPIC_BASE_URL=${sanitizeEnvValue(config.anthropicBaseUrl)}`,
-    );
-  }
-  if (config.anthropicAuthToken) {
-    if (config.anthropicBaseUrl) {
-      // Third-party provider: the SDK treats ANTHROPIC_AUTH_TOKEN as an OAuth
-      // legacy token and skips the standard Bearer header, causing 404 on
-      // non-Anthropic endpoints. Use ANTHROPIC_API_KEY instead so the SDK
-      // sends the correct Authorization header.
+  if (backend === 'anthropic_official') {
+    // When full OAuth credentials exist, authentication is handled by .credentials.json file.
+    // Only fall back to CLAUDE_CODE_OAUTH_TOKEN env var for legacy single-token mode.
+    if (!config.claudeOAuthCredentials && config.claudeCodeOauthToken) {
       lines.push(
-        `ANTHROPIC_API_KEY=${sanitizeEnvValue(config.anthropicAuthToken)}`,
+        `CLAUDE_CODE_OAUTH_TOKEN=${sanitizeEnvValue(config.claudeCodeOauthToken)}`,
       );
-    } else {
+    }
+    if (config.anthropicApiKey) {
+      lines.push(
+        `ANTHROPIC_API_KEY=${sanitizeEnvValue(config.anthropicApiKey)}`,
+      );
+    }
+    if (config.anthropicBaseUrl) {
+      lines.push(
+        `ANTHROPIC_BASE_URL=${sanitizeEnvValue(config.anthropicBaseUrl)}`,
+      );
+    }
+    if (config.anthropicAuthToken) {
       lines.push(
         `ANTHROPIC_AUTH_TOKEN=${sanitizeEnvValue(config.anthropicAuthToken)}`,
       );
     }
+    if (config.anthropicModel) {
+      lines.push(`ANTHROPIC_MODEL=${sanitizeEnvValue(config.anthropicModel)}`);
+    }
+  } else {
+    if (config.anthropicApiKey) {
+      lines.push(
+        `ANTHROPIC_API_KEY=${sanitizeEnvValue(config.anthropicApiKey)}`,
+      );
+    }
+    if (config.anthropicBaseUrl) {
+      lines.push(
+        `ANTHROPIC_BASE_URL=${sanitizeEnvValue(config.anthropicBaseUrl)}`,
+      );
+    }
+    if (config.anthropicAuthToken && config.anthropicBaseUrl) {
+      // Anthropic Messages compatible third-party providers use API key auth.
+      lines.push(
+        `ANTHROPIC_API_KEY=${sanitizeEnvValue(config.anthropicAuthToken)}`,
+      );
+    } else if (config.anthropicAuthToken) {
+      lines.push(
+        `ANTHROPIC_AUTH_TOKEN=${sanitizeEnvValue(config.anthropicAuthToken)}`,
+      );
+    }
+    if (config.anthropicModel) {
+      lines.push(`ANTHROPIC_MODEL=${sanitizeEnvValue(config.anthropicModel)}`);
+    }
   }
-  if (config.anthropicModel) {
-    lines.push(`ANTHROPIC_MODEL=${sanitizeEnvValue(config.anthropicModel)}`);
+
+  if (config.disableExperimentalBetas === true) {
+    lines.push('CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1');
   }
 
   // Use explicit profileCustomEnv if provided (pool mode), otherwise active profile
@@ -2354,8 +2748,35 @@ export function buildClaudeEnvLines(
   return lines;
 }
 
+export function envLinesToRecord(lines: string[]): Record<string, string> {
+  const record: Record<string, string> = {};
+  for (const line of lines) {
+    const eqIdx = line.indexOf('=');
+    if (eqIdx <= 0) continue;
+    record[line.slice(0, eqIdx)] = line.slice(eqIdx + 1);
+  }
+  return record;
+}
+
+export function shouldStripClaudeOAuthArtifacts(
+  backend?: ProviderBackend,
+): boolean {
+  return backend !== undefined && backend !== 'anthropic_official';
+}
+
+export function shouldStripInheritedAnthropicAuthToken(
+  backend: ProviderBackend | undefined,
+  generatedEnv: Record<string, string>,
+): boolean {
+  return (
+    backend !== undefined &&
+    backend !== 'anthropic_official' &&
+    generatedEnv.ANTHROPIC_AUTH_TOKEN === undefined
+  );
+}
+
 export function getActiveProfileCustomEnv(): Record<string, string> {
-  const state = readStoredStateV4();
+  const state = readStoredStateV5();
   if (!state) return {};
 
   const enabled = state.providers.find((p) => p.enabled) || state.providers[0];
@@ -2396,6 +2817,7 @@ export function resolveProfileToConfig(
   const profile = fromStoredProfile(stored);
   return buildConfig(
     {
+      backend: defaultBackendForType('third_party'),
       anthropicBaseUrl: profile.anthropicBaseUrl,
       anthropicAuthToken: profile.anthropicAuthToken,
       anthropicApiKey: state.officialSecrets.anthropicApiKey,
@@ -2622,7 +3044,14 @@ export function mergeClaudeEnvConfig(
   global: ClaudeProviderConfig,
   override: ContainerEnvConfig,
 ): ClaudeProviderConfig {
+  const backend = override.anthropicBaseUrl
+    ? defaultBackendForType('third_party')
+    : global.backend;
   const merged: ClaudeProviderConfig = {
+    ...(backend !== undefined ? { backend } : {}),
+    ...(global.disableExperimentalBetas !== undefined
+      ? { disableExperimentalBetas: global.disableExperimentalBetas }
+      : {}),
     anthropicBaseUrl: override.anthropicBaseUrl || global.anthropicBaseUrl,
     anthropicAuthToken:
       override.anthropicAuthToken || global.anthropicAuthToken,
@@ -2635,10 +3064,13 @@ export function mergeClaudeEnvConfig(
     updatedAt: global.updatedAt,
   };
 
-  // Third-party provider: strip OAuth credentials so the SDK does not try
-  // the OAuth auth path (which skips the standard Bearer header and causes
-  // 404 on non-Anthropic endpoints like Kimi).
-  if (merged.anthropicBaseUrl) {
+  // Third-party-compatible backends: strip OAuth credentials so the SDK does
+  // not try the OAuth auth path.
+  const stripOAuth =
+    merged.backend !== undefined
+      ? shouldStripClaudeOAuthArtifacts(merged.backend)
+      : !!merged.anthropicBaseUrl;
+  if (stripOAuth) {
     merged.claudeOAuthCredentials = null;
     merged.claudeCodeOauthToken = '';
   }
