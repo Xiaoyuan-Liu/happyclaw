@@ -48,6 +48,19 @@ const RESERVED_CLAUDE_ENV_KEYS = new Set([
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_MODEL',
+  // Backend dispatch flags (Bedrock / Vertex / Foundry) — set by buildClaudeEnvLines,
+  // must not be overridden via customEnv.
+  'CLAUDE_CODE_USE_BEDROCK',
+  'CLAUDE_CODE_USE_VERTEX',
+  'CLAUDE_CODE_USE_FOUNDRY',
+  'CLAUDE_CODE_SKIP_BEDROCK_AUTH',
+  'CLAUDE_CODE_SKIP_VERTEX_AUTH',
+  'ANTHROPIC_BEDROCK_BASE_URL',
+  'ANTHROPIC_VERTEX_BASE_URL',
+  'ANTHROPIC_FOUNDRY_BASE_URL',
+  'ANTHROPIC_FOUNDRY_API_KEY',
+  // Telemetry tag identifying HappyClaw as the SDK client app
+  'CLAUDE_AGENT_SDK_CLIENT_APP',
 ]);
 const DANGEROUS_ENV_VARS = new Set([
   // Code execution / preload attacks
@@ -2682,6 +2695,13 @@ export function buildClaudeEnvLines(
       ? defaultBackendForType('third_party')
       : defaultBackendForType('official'));
 
+  // Use explicit profileCustomEnv if provided (pool mode), otherwise active profile
+  const customEnv = profileCustomEnv ?? getActiveProfileCustomEnv();
+
+  // Inject SDK client-app telemetry tag for every backend. The key is reserved
+  // (RESERVED_CLAUDE_ENV_KEYS) so customEnv cannot shadow or duplicate it.
+  lines.push('CLAUDE_AGENT_SDK_CLIENT_APP=happyclaw');
+
   if (backend === 'anthropic_official') {
     // When full OAuth credentials exist, authentication is handled by .credentials.json file.
     // Only fall back to CLAUDE_CODE_OAUTH_TOKEN env var for legacy single-token mode.
@@ -2708,7 +2728,7 @@ export function buildClaudeEnvLines(
     if (config.anthropicModel) {
       lines.push(`ANTHROPIC_MODEL=${sanitizeEnvValue(config.anthropicModel)}`);
     }
-  } else {
+  } else if (backend === 'anthropic_messages') {
     if (config.anthropicApiKey) {
       lines.push(
         `ANTHROPIC_API_KEY=${sanitizeEnvValue(config.anthropicApiKey)}`,
@@ -2732,14 +2752,71 @@ export function buildClaudeEnvLines(
     if (config.anthropicModel) {
       lines.push(`ANTHROPIC_MODEL=${sanitizeEnvValue(config.anthropicModel)}`);
     }
+  } else if (backend === 'bedrock') {
+    // AWS-direct Bedrock. SDK auths via AWS credential chain (env / profile /
+    // IRSA), so HappyClaw does not hard-code any AWS env keys here — users
+    // wire AWS_*/AWS_REGION via customEnv or container-env overrides.
+    lines.push('CLAUDE_CODE_USE_BEDROCK=1');
+    if (config.anthropicModel) {
+      lines.push(`ANTHROPIC_MODEL=${sanitizeEnvValue(config.anthropicModel)}`);
+    }
+  } else if (backend === 'bedrock_gateway') {
+    // LLM-gateway in front of Bedrock. Skip AWS auth, point SDK at gateway URL.
+    // Gateway's own auth token (if any) must be injected via customEnv.
+    lines.push('CLAUDE_CODE_USE_BEDROCK=1');
+    lines.push('CLAUDE_CODE_SKIP_BEDROCK_AUTH=1');
+    if (config.anthropicBaseUrl) {
+      lines.push(
+        `ANTHROPIC_BEDROCK_BASE_URL=${sanitizeEnvValue(config.anthropicBaseUrl)}`,
+      );
+    }
+    if (config.anthropicModel) {
+      lines.push(`ANTHROPIC_MODEL=${sanitizeEnvValue(config.anthropicModel)}`);
+    }
+  } else if (backend === 'vertex') {
+    // GCP-direct Vertex AI. SDK auths via GOOGLE_APPLICATION_CREDENTIALS /
+    // ADC. HappyClaw does not inject project_id/region — wire via customEnv.
+    lines.push('CLAUDE_CODE_USE_VERTEX=1');
+    if (config.anthropicModel) {
+      lines.push(`ANTHROPIC_MODEL=${sanitizeEnvValue(config.anthropicModel)}`);
+    }
+  } else if (backend === 'vertex_gateway') {
+    // LLM-gateway in front of Vertex. Skip GCP auth, point SDK at gateway.
+    // Gateway token + project/region must come from customEnv.
+    lines.push('CLAUDE_CODE_USE_VERTEX=1');
+    lines.push('CLAUDE_CODE_SKIP_VERTEX_AUTH=1');
+    if (config.anthropicBaseUrl) {
+      lines.push(
+        `ANTHROPIC_VERTEX_BASE_URL=${sanitizeEnvValue(config.anthropicBaseUrl)}`,
+      );
+    }
+    if (config.anthropicModel) {
+      lines.push(`ANTHROPIC_MODEL=${sanitizeEnvValue(config.anthropicModel)}`);
+    }
+  } else if (backend === 'foundry') {
+    // Azure AI Foundry. Single API key, optional base URL override.
+    lines.push('CLAUDE_CODE_USE_FOUNDRY=1');
+    if (config.anthropicBaseUrl) {
+      lines.push(
+        `ANTHROPIC_FOUNDRY_BASE_URL=${sanitizeEnvValue(config.anthropicBaseUrl)}`,
+      );
+    }
+    // Either anthropicApiKey or anthropicAuthToken can carry the Foundry key.
+    const foundryKey = config.anthropicApiKey || config.anthropicAuthToken;
+    if (foundryKey) {
+      lines.push(
+        `ANTHROPIC_FOUNDRY_API_KEY=${sanitizeEnvValue(foundryKey)}`,
+      );
+    }
+    if (config.anthropicModel) {
+      lines.push(`ANTHROPIC_MODEL=${sanitizeEnvValue(config.anthropicModel)}`);
+    }
   }
 
   if (config.disableExperimentalBetas === true) {
     lines.push('CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1');
   }
 
-  // Use explicit profileCustomEnv if provided (pool mode), otherwise active profile
-  const customEnv = profileCustomEnv ?? getActiveProfileCustomEnv();
   for (const [key, value] of Object.entries(customEnv)) {
     if (RESERVED_CLAUDE_ENV_KEYS.has(key)) continue;
     lines.push(`${key}=${sanitizeEnvValue(value)}`);

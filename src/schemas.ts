@@ -664,6 +664,35 @@ export const UnifiedProviderCreateSchema = z
         message: '第三方供应商需要提供 Base URL 或 Auth Token',
       });
     }
+    // Backend-specific cross-field requirements.
+    if (data.backend === 'bedrock_gateway' && !data.anthropicBaseUrl?.trim()) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['anthropicBaseUrl'],
+        message:
+          'Bedrock 网关后端必须提供 Base URL（用作 ANTHROPIC_BEDROCK_BASE_URL）',
+      });
+    }
+    if (data.backend === 'vertex_gateway' && !data.anthropicBaseUrl?.trim()) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['anthropicBaseUrl'],
+        message:
+          'Vertex 网关后端必须提供 Base URL（用作 ANTHROPIC_VERTEX_BASE_URL）',
+      });
+    }
+    if (
+      data.backend === 'foundry' &&
+      !data.anthropicApiKey?.trim() &&
+      !data.anthropicAuthToken?.trim()
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['anthropicApiKey'],
+        message:
+          'Foundry 后端必须提供 API Key（anthropicApiKey 或 anthropicAuthToken 之一）',
+      });
+    }
   })
   .transform((data) => ({
     ...data,
@@ -681,6 +710,35 @@ export const UnifiedProviderPatchSchema = z
     anthropicModel: z.string().max(128).optional(),
     customEnv: z.record(z.string().max(256), z.string().max(4096)).optional(),
     weight: z.number().int().min(1).max(100).optional(),
+  })
+  .superRefine((data, ctx) => {
+    // Backend-specific cross-field requirements (only enforced when caller
+    // explicitly provides the relevant field — partial updates that omit
+    // base URL keep the previously-stored value, so we don't error here).
+    if (
+      data.backend === 'bedrock_gateway' &&
+      data.anthropicBaseUrl !== undefined &&
+      !data.anthropicBaseUrl.trim()
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['anthropicBaseUrl'],
+        message:
+          'Bedrock 网关后端必须提供 Base URL（用作 ANTHROPIC_BEDROCK_BASE_URL）',
+      });
+    }
+    if (
+      data.backend === 'vertex_gateway' &&
+      data.anthropicBaseUrl !== undefined &&
+      !data.anthropicBaseUrl.trim()
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['anthropicBaseUrl'],
+        message:
+          'Vertex 网关后端必须提供 Base URL（用作 ANTHROPIC_VERTEX_BASE_URL）',
+      });
+    }
   })
   .refine(
     (data) =>
