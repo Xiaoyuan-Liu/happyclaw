@@ -186,16 +186,23 @@ export function ClaudeProviderSection({ setNotice, setError }: ClaudeProviderSec
   const handleDuplicate = useCallback(
     async (provider: ProviderWithHealth) => {
       try {
+        // 注意：customEnv 在 GET 接口已被脱敏（customEnvMasked），把脱敏字符串
+        // 当成真实 env 写回会污染配置；副本 provider 不复制 customEnv 内容，
+        // 用户需在编辑面板重新填写真实值。原始 provider 的 key 列表会附在通知里
+        // 供用户参考。
         await api.post('/api/config/claude/providers', {
           name: `${provider.name} (副本)`,
           type: 'third_party',
           anthropicBaseUrl: provider.anthropicBaseUrl,
           anthropicModel: provider.anthropicModel,
-          customEnv: provider.customEnv,
           enabled: false,
         });
         await loadProviders();
-        setNotice(`已复制提供商「${provider.name}」，密钥需要重新填写`);
+        const keys = provider.customEnvKeys ?? [];
+        const keyHint = keys.length > 0 ? `（原 customEnv 包含 ${keys.length} 项 key：${keys.join(', ')}）` : '';
+        setNotice(
+          `已复制提供商「${provider.name}」，密钥与自定义环境变量需要重新填写${keyHint}`,
+        );
       } catch (err) {
         setError(getErrorMessage(err, '复制提供商失败'));
       }

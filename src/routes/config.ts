@@ -843,7 +843,13 @@ configRoutes.put(
       const updated = updateProvider(enabled[0].id, {
         customEnv: validation.data.customEnv,
       });
-      return c.json({ customEnv: updated.customEnv });
+      // Do not echo plaintext env values — return the masked public DTO so
+      // clients can confirm which keys were stored without leaking secrets.
+      const publicProvider = toPublicProvider(updated);
+      return c.json({
+        customEnvMasked: publicProvider.customEnvMasked,
+        customEnvKeys: publicProvider.customEnvKeys,
+      });
     } catch (err) {
       const message =
         err instanceof Error ? err.message : 'Invalid custom env payload';

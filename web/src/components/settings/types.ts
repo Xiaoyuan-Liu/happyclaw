@@ -31,7 +31,15 @@ export interface UnifiedProviderPublic {
   hasClaudeOAuthCredentials: boolean;
   claudeOAuthCredentialsExpiresAt: number | null;
   claudeOAuthCredentialsAccessTokenMasked: string | null;
-  customEnv: Record<string, string>;
+  /**
+   * Custom env values returned with each value masked (run through
+   * maskSecret on the server). These are display-only — the UI must not send
+   * masked strings back as plaintext values; use the `customEnvPatch` merge
+   * field on the patch endpoint to update only the keys the user changed.
+   */
+  customEnvMasked: Record<string, string>;
+  /** Stable list of customEnv key names (mirrors `customEnvMasked` keys). */
+  customEnvKeys: string[];
   updatedAt: string;
 }
 

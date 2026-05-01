@@ -14,6 +14,15 @@ import { api } from '../../api/client';
 import type { ProviderWithHealth, EnvRow, ProviderBackend } from './types';
 import { getErrorMessage } from './types';
 
+/**
+ * Sentinel marking a customEnv row whose value is currently displayed in masked
+ * form (returned by the server as `customEnvMasked[key]`). When the user does
+ * NOT edit such a row, we omit it from the merge patch so the stored secret
+ * stays untouched. Any row whose value differs from this sentinel was edited
+ * by the user and is sent as a real new value.
+ */
+const MASKED_VALUE_PLACEHOLDER = '__HAPPYCLAW_MASKED__';
+
 type ProviderType = 'official' | 'third_party';
 type OfficialAuthTab = 'oauth' | 'setup_token' | 'api_key';
 
@@ -64,6 +73,12 @@ function deriveProviderType(backend: ProviderBackend | undefined): ProviderType 
   return backend === 'anthropic_official' ? 'official' : 'third_party';
 }
 
+/**
+ * Keys reserved for dedicated form fields. The UI surfaces a separate password
+ * input for each (Base URL / Auth Token / API Key / OAuth Token / Model), so
+ * users should never re-enter them in the customEnv table. The error message
+ * tells the user which field to use instead.
+ */
 const RESERVED_ENV_KEYS = new Set([
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_AUTH_TOKEN',
@@ -72,34 +87,161 @@ const RESERVED_ENV_KEYS = new Set([
   'ANTHROPIC_MODEL',
 ]);
 
-function buildCustomEnv(rows: EnvRow[]): { customEnv: Record<string, string>; error: string | null } {
-  const customEnv: Record<string, string> = {};
+/**
+ * Row tracker used by the customEnv editor. `originalKey` records the key as
+ * the row was first loaded from the server (null for newly-added rows); when
+ * the user renames a row we treat it as delete-old + create-new in the merge
+ * patch. `dirty` flips to true the first time the user edits the value.
+ */
+interface CustomEnvRow extends EnvRow {
+  originalKey: string | null;
+  /** True when value differs from the masked placeholder we initialized with. */
+  dirty: boolean;
+}
+
+interface CustomEnvBuildResult {
+  patch: Record<string, string | null>;
+  error: string | null;
+}
+
+/**
+ * Build a `customEnvPatch` for merge-update semantics:
+ *
+ * - keys present in `originalKeys` but missing from `rows` -> set to null (delete)
+ * - rows whose value is still the masked sentinel -> omitted (server keeps stored value)
+ * - rows where the user edited the value -> included with the new plaintext value
+ * - rows where the user renamed the key -> delete original + add new
+ */
+function buildCustomEnvPatch(
+  rows: CustomEnvRow[],
+  originalKeys: string[],
+): CustomEnvBuildResult {
+  const patch: Record<string, string | null> = {};
+  const seenKeys = new Set<string>();
+  const survivingOriginals = new Set<string>();
 
   for (const [idx, row] of rows.entries()) {
     const key = row.key.trim();
     const value = row.value;
 
-    if (!key && !value.trim()) continue;
+    // Allow deleting an empty/empty row even if it had no original key.
+    if (!key && !value.trim() && row.originalKey === null) continue;
 
     if (!key) {
-      return { customEnv: {}, error: `第 ${idx + 1} 行环境变量 Key 不能为空` };
+      return { patch: {}, error: `第 ${idx + 1} 行环境变量 Key 不能为空` };
     }
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
       return {
-        customEnv: {},
+        patch: {},
         error: `环境变量 Key "${key}" 格式无效（需匹配 [A-Za-z_][A-Za-z0-9_]*）`,
       };
     }
     if (RESERVED_ENV_KEYS.has(key)) {
-      return { customEnv: {}, error: `${key} 属于系统保留字段，请在配置表单中填写` };
+      return {
+        patch: {},
+        error: `${key} 已有专用配置区，不要在自定义环境变量表中重复填写`,
+      };
     }
-    if (customEnv[key] !== undefined) {
-      return { customEnv: {}, error: `环境变量 Key "${key}" 重复` };
+    if (seenKeys.has(key)) {
+      return { patch: {}, error: `环境变量 Key "${key}" 重复` };
     }
-    customEnv[key] = value;
+    seenKeys.add(key);
+
+    // Renamed key: delete the old key as part of the patch.
+    if (row.originalKey && row.originalKey !== key) {
+      patch[row.originalKey] = null;
+    }
+    if (row.originalKey === key) {
+      survivingOriginals.add(key);
+    }
+
+    // Untouched masked rows: skip — keep stored value as-is.
+    if (!row.dirty && row.originalKey !== null && row.originalKey === key) {
+      continue;
+    }
+
+    // Brand-new row with an empty value is ambiguous — require a real value.
+    if (row.originalKey === null && !value) {
+      return {
+        patch: {},
+        error: `环境变量 "${key}" 缺少 value`,
+      };
+    }
+
+    patch[key] = value;
   }
 
-  return { customEnv, error: null };
+  // Any original key the user removed (no surviving row) -> explicit delete.
+  for (const orig of originalKeys) {
+    if (!survivingOriginals.has(orig) && !(orig in patch)) {
+      patch[orig] = null;
+    }
+  }
+
+  return { patch, error: null };
+}
+
+/** Backend-aware client-side validation, mirrored from the server's
+ *  validateProviderFinalState() so the user gets immediate feedback. */
+interface ValidateBackendFieldsArgs {
+  providerType: ProviderType;
+  thirdPartyBackend: ThirdPartyBackend;
+  baseUrl: string;
+  /** Auth token currently in the form (may be empty if user did not edit). */
+  authToken: string;
+  /** True when the provider already has a stored auth token (edit mode). */
+  hasStoredAuthToken: boolean;
+  /** True when the user marked the existing token for clearing. */
+  clearTokenOnSave: boolean;
+  /** API key currently in the form (foundry-only path). */
+  apiKey: string;
+  /** True when the provider already has a stored API key (edit mode). */
+  hasStoredApiKey: boolean;
+}
+
+function validateBackendFields(args: ValidateBackendFieldsArgs): string | null {
+  if (args.providerType === 'official') return null;
+  const trimmedBase = args.baseUrl.trim();
+  const trimmedToken = args.authToken.trim();
+  const trimmedKey = args.apiKey.trim();
+
+  // Effective credential availability after this save:
+  //   - clearTokenOnSave wipes the stored token (or it is empty already)
+  //   - otherwise stored token survives if user did not type a new one
+  const tokenWillBePresent = args.clearTokenOnSave
+    ? trimmedToken !== ''
+    : trimmedToken !== '' || args.hasStoredAuthToken;
+  const apiKeyWillBePresent = trimmedKey !== '' || args.hasStoredApiKey;
+
+  switch (args.thirdPartyBackend) {
+    case 'anthropic_messages':
+      if (!trimmedBase) return '请填写 ANTHROPIC_BASE_URL';
+      if (!tokenWillBePresent && !apiKeyWillBePresent) {
+        return '兼容网关 provider 必须提供 Auth Token 或 API Key';
+      }
+      return null;
+    case 'bedrock_gateway':
+      if (!trimmedBase) {
+        return 'Bedrock 网关后端必须填写 Base URL（用作 ANTHROPIC_BEDROCK_BASE_URL）';
+      }
+      return null;
+    case 'vertex_gateway':
+      if (!trimmedBase) {
+        return 'Vertex 网关后端必须填写 Base URL（用作 ANTHROPIC_VERTEX_BASE_URL）';
+      }
+      return null;
+    case 'foundry':
+      if (!tokenWillBePresent && !apiKeyWillBePresent) {
+        return 'Foundry 后端必须提供 API Key 或 Auth Token';
+      }
+      return null;
+    case 'bedrock':
+    case 'vertex':
+      // Direct cloud auth — credentials live in customEnv / IAM role / GCP ADC.
+      return null;
+    default:
+      return null;
+  }
 }
 
 interface ProviderEditorProps {
@@ -151,8 +293,11 @@ export function ProviderEditor({
   const [authTokenDirty, setAuthTokenDirty] = useState(false);
   const [clearTokenOnSave, setClearTokenOnSave] = useState(false);
 
-  // 环境变量
-  const [customEnvRows, setCustomEnvRows] = useState<EnvRow[]>([]);
+  // 环境变量 — 编辑模式下，row.value 初始为脱敏占位符，dirty=false 表示用户尚未修改，
+  // 提交时会被合并补丁忽略（保留服务端已存的真实值）。
+  const [customEnvRows, setCustomEnvRows] = useState<CustomEnvRow[]>([]);
+  // 编辑模式下加载时的原始 key 列表（用于检测删除）。
+  const [originalEnvKeys, setOriginalEnvKeys] = useState<string[]>([]);
 
   // 状态
   const [saving, setSaving] = useState(false);
@@ -178,6 +323,7 @@ export function ProviderEditor({
       setAuthTokenDirty(false);
       setClearTokenOnSave(false);
       setCustomEnvRows([]);
+      setOriginalEnvKeys([]);
     } else {
       const derivedType = deriveProviderType(provider.backend);
       setProviderType(derivedType);
@@ -203,17 +349,41 @@ export function ProviderEditor({
       setAuthToken('');
       setAuthTokenDirty(false);
       setClearTokenOnSave(false);
-      const envRows = Object.entries(provider.customEnv || {}).map(([key, value]) => ({ key, value }));
+      // customEnv 已经由后端脱敏（customEnvMasked），此处用占位符填充；
+      // 用户编辑后 dirty 才置为 true，保存时只会提交被改过的 key。
+      const masked = provider.customEnvMasked || {};
+      const keys = provider.customEnvKeys ?? Object.keys(masked);
+      const envRows: CustomEnvRow[] = keys.map((key) => ({
+        key,
+        value: MASKED_VALUE_PLACEHOLDER,
+        originalKey: key,
+        dirty: false,
+      }));
       setCustomEnvRows(envRows);
+      setOriginalEnvKeys(keys);
     }
   }, [open, isCreate, provider]);
 
-  const addRow = () => setCustomEnvRows((prev) => [...prev, { key: '', value: '' }]);
+  const addRow = () =>
+    setCustomEnvRows((prev) => [
+      ...prev,
+      { key: '', value: '', originalKey: null, dirty: true },
+    ]);
   const removeRow = (index: number) =>
     setCustomEnvRows((prev) => prev.filter((_, i) => i !== index));
   const updateRow = (index: number, field: keyof EnvRow, value: string) =>
     setCustomEnvRows((prev) =>
-      prev.map((row, i) => (i === index ? { ...row, [field]: value } : row)),
+      prev.map((row, i) =>
+        i === index
+          ? {
+              ...row,
+              [field]: value,
+              // 任何修改都视为 dirty —— 当用户编辑掉脱敏占位符或修改 key 时，
+              // 这一行的 value 会作为新明文写回服务器。
+              dirty: true,
+            }
+          : row,
+      ),
     );
 
   // ─── OAuth 流程 ─────────────────────────────────────────────
@@ -271,7 +441,25 @@ export function ProviderEditor({
       return;
     }
 
-    const envResult = buildCustomEnv(customEnvRows);
+    // 统一 backend-aware 必填校验（创建/编辑都跑一遍）。
+    const backendError = validateBackendFields({
+      providerType,
+      thirdPartyBackend,
+      baseUrl,
+      authToken,
+      hasStoredAuthToken: !isCreate && !!provider?.hasAnthropicAuthToken,
+      clearTokenOnSave,
+      apiKey,
+      hasStoredApiKey: !isCreate && !!provider?.hasAnthropicApiKey,
+    });
+    if (backendError) {
+      setError(backendError);
+      return;
+    }
+
+    // customEnv 改用 merge-patch：编辑时未被用户改动的脱敏行不会回传明文，
+    // 服务端按补丁合并到已存的真实值上。
+    const envResult = buildCustomEnvPatch(customEnvRows, originalEnvKeys);
     if (envResult.error) {
       setError(envResult.error);
       return;
@@ -286,50 +474,24 @@ export function ProviderEditor({
         const finalBackend: ProviderBackend =
           providerType === 'official' ? 'anthropic_official' : thirdPartyBackend;
 
+        // 创建时直接用全量 customEnv（patch 的 null 值不可能存在，因为创建模式
+        // 没有任何"原始 key"）。
+        const createCustomEnv: Record<string, string> = {};
+        for (const [k, v] of Object.entries(envResult.patch)) {
+          if (typeof v === 'string') createCustomEnv[k] = v;
+        }
+
         const createBody: Record<string, unknown> = {
           name: trimmedName,
           type: providerType,
           backend: finalBackend,
-          customEnv: envResult.customEnv,
+          customEnv: createCustomEnv,
           weight,
         };
 
         if (providerType === 'third_party') {
           const trimmedBaseUrl = baseUrl.trim();
           const trimmedToken = authToken.trim();
-
-          // backend-specific 必填校验（与后端 schema 对齐，提前给用户更友好的提示）
-          if (thirdPartyBackend === 'anthropic_messages') {
-            if (!trimmedBaseUrl) {
-              setError('请填写 ANTHROPIC_BASE_URL');
-              setSaving(false);
-              return;
-            }
-            if (!trimmedToken) {
-              setError('新建 Anthropic 兼容网关 provider 时必须填写 Auth Token');
-              setSaving(false);
-              return;
-            }
-          } else if (thirdPartyBackend === 'bedrock_gateway') {
-            if (!trimmedBaseUrl) {
-              setError('Bedrock 网关后端必须填写 Base URL（用作 ANTHROPIC_BEDROCK_BASE_URL）');
-              setSaving(false);
-              return;
-            }
-          } else if (thirdPartyBackend === 'vertex_gateway') {
-            if (!trimmedBaseUrl) {
-              setError('Vertex 网关后端必须填写 Base URL（用作 ANTHROPIC_VERTEX_BASE_URL）');
-              setSaving(false);
-              return;
-            }
-          } else if (thirdPartyBackend === 'foundry') {
-            if (!trimmedToken && !apiKey.trim()) {
-              setError('Foundry 后端必须提供 API Key 或 Auth Token');
-              setSaving(false);
-              return;
-            }
-          }
-          // bedrock / vertex 直连后端字段留给 customEnv
 
           if (trimmedBaseUrl) createBody.anthropicBaseUrl = trimmedBaseUrl;
           if (trimmedToken) createBody.anthropicAuthToken = trimmedToken;
@@ -403,9 +565,12 @@ export function ProviderEditor({
         const patchBody: Record<string, unknown> = {
           name: trimmedName,
           backend: finalBackend,
-          customEnv: envResult.customEnv,
           weight,
         };
+        // 仅当真的有 customEnv 变更时才发送 patch，避免空对象触发"至少一个字段"校验。
+        if (Object.keys(envResult.patch).length > 0) {
+          patchBody.customEnvPatch = envResult.patch;
+        }
 
         if (providerType === 'third_party') {
           patchBody.anthropicBaseUrl = baseUrl.trim();
@@ -819,26 +984,28 @@ export function ProviderEditor({
                 </>
               )}
 
-              {/* bedrock：仅 model + customEnv 提示 */}
+              {/* bedrock：直连 cloud — 凭据走 IAM/AWS profile，不推荐 secret 入 customEnv */}
               {thirdPartyBackend === 'bedrock' && (
                 <div className="rounded-md border border-amber-200 bg-amber-50/50 dark:bg-amber-950/30 p-3 text-xs text-amber-800 dark:text-amber-300 space-y-1">
-                  <div className="font-medium">AWS 凭据通过自定义环境变量透传</div>
+                  <div className="font-medium">直连 AWS Bedrock — 凭据建议走运维侧机制</div>
                   <div>
-                    将以下任一组合填入下方「自定义环境变量」：
+                    推荐使用 IAM Role / EC2 instance profile / 容器 secret 等机制让进程自动获取 AWS 凭据；
+                    如确实需要通过环境变量传递（例如本地调试），可在下方「自定义环境变量」加入
+                    <code className="bg-muted px-1 rounded mx-1">AWS_REGION</code>、
+                    <code className="bg-muted px-1 rounded">AWS_PROFILE</code>
+                    等非敏感配置。
                   </div>
-                  <ul className="list-disc ml-5 space-y-0.5">
-                    <li><code className="bg-muted px-1 rounded">AWS_REGION</code>（必填，例如 us-east-1）</li>
-                    <li><code className="bg-muted px-1 rounded">AWS_PROFILE</code>（如使用 ~/.aws/credentials profile）</li>
-                    <li><code className="bg-muted px-1 rounded">AWS_ACCESS_KEY_ID</code> + <code className="bg-muted px-1 rounded">AWS_SECRET_ACCESS_KEY</code>（如显式凭据）</li>
-                    <li><code className="bg-muted px-1 rounded">AWS_BEARER_TOKEN_BEDROCK</code>（如使用 bearer token 认证）</li>
-                  </ul>
+                  <div>
+                    自定义环境变量在 GET 接口中以脱敏形式回显，但仍以加密形式持久化在磁盘。
+                    凡敏感长期密钥（access key / secret / bearer token），优先用 IAM 短期凭据替代。
+                  </div>
                   <div>
                     HappyClaw 会自动注入 <code className="bg-muted px-1 rounded">CLAUDE_CODE_USE_BEDROCK=1</code>。
                   </div>
                 </div>
               )}
 
-              {/* bedrock_gateway：Base URL（必填）+ customEnv 提示 */}
+              {/* bedrock_gateway：Base URL（必填）+ 专用 Auth Token + customEnv 提示 */}
               {thirdPartyBackend === 'bedrock_gateway' && (
                 <>
                   <div>
@@ -856,12 +1023,58 @@ export function ProviderEditor({
                       placeholder="https://litellm.example.com/bedrock"
                     />
                   </div>
+
+                  <div>
+                    <label className="block text-xs text-muted-foreground mb-1">
+                      Auth Token（网关认证，注入为 ANTHROPIC_AUTH_TOKEN）
+                      {!isCreate && provider?.hasAnthropicAuthToken
+                        ? ` (${provider.anthropicAuthTokenMasked})`
+                        : ''}
+                    </label>
+                    <Input
+                      type="password"
+                      value={authToken}
+                      onChange={(e) => {
+                        setAuthToken(e.target.value);
+                        setAuthTokenDirty(true);
+                        setClearTokenOnSave(false);
+                      }}
+                      disabled={saving || clearTokenOnSave}
+                      placeholder={
+                        isCreate
+                          ? '可选 — 网关要求 ANTHROPIC_AUTH_TOKEN 时填入'
+                          : provider?.hasAnthropicAuthToken
+                            ? '留空不变；输入新值覆盖'
+                            : '可选 — 网关要求 ANTHROPIC_AUTH_TOKEN 时填入'
+                      }
+                    />
+                    <p className="text-[11px] text-muted-foreground mt-1">
+                      网关 token 通过此专用字段加密存储，<strong>不要</strong>在下方「自定义环境变量」里再次填写
+                      <code className="bg-muted px-1 rounded mx-1">ANTHROPIC_AUTH_TOKEN</code>。
+                    </p>
+                    {!isCreate && provider?.hasAnthropicAuthToken && (
+                      <label className="mt-2 inline-flex items-center gap-2 text-xs text-muted-foreground">
+                        <input
+                          type="checkbox"
+                          checked={clearTokenOnSave}
+                          onChange={(e) => {
+                            setClearTokenOnSave(e.target.checked);
+                            if (e.target.checked) {
+                              setAuthToken('');
+                              setAuthTokenDirty(false);
+                            }
+                          }}
+                          disabled={saving}
+                        />
+                        保存时清空当前 Token
+                      </label>
+                    )}
+                  </div>
+
                   <div className="rounded-md border border-amber-200 bg-amber-50/50 dark:bg-amber-950/30 p-3 text-xs text-amber-800 dark:text-amber-300 space-y-1">
-                    <div className="font-medium">网关 Token 通过自定义环境变量透传</div>
                     <div>
-                      请参考 LiteLLM/one-api 等网关文档，将其要求的认证 env（通常是
-                      <code className="bg-muted px-1 rounded mx-1">ANTHROPIC_AUTH_TOKEN</code>
-                      或 <code className="bg-muted px-1 rounded">AWS_BEARER_TOKEN_BEDROCK</code>）填到下方「自定义环境变量」。
+                      其他网关专属变量（例如 <code className="bg-muted px-1 rounded">AWS_BEARER_TOKEN_BEDROCK</code>）
+                      可填到下方「自定义环境变量」。
                     </div>
                     <div>
                       HappyClaw 会自动注入
@@ -872,23 +1085,27 @@ export function ProviderEditor({
                 </>
               )}
 
-              {/* vertex：仅 model + customEnv 提示 */}
+              {/* vertex：直连 GCP — 凭据走 ADC，不推荐 secret 入 customEnv */}
               {thirdPartyBackend === 'vertex' && (
                 <div className="rounded-md border border-amber-200 bg-amber-50/50 dark:bg-amber-950/30 p-3 text-xs text-amber-800 dark:text-amber-300 space-y-1">
-                  <div className="font-medium">GCP 凭据通过自定义环境变量透传</div>
-                  <div>请把以下 env 填到下方「自定义环境变量」：</div>
-                  <ul className="list-disc ml-5 space-y-0.5">
-                    <li><code className="bg-muted px-1 rounded">ANTHROPIC_VERTEX_PROJECT_ID</code>（GCP project ID）</li>
-                    <li><code className="bg-muted px-1 rounded">CLOUD_ML_REGION</code>（如 us-east5）</li>
-                    <li><code className="bg-muted px-1 rounded">GOOGLE_APPLICATION_CREDENTIALS</code>（service account JSON 路径）</li>
-                  </ul>
+                  <div className="font-medium">直连 GCP Vertex — 凭据建议走运维侧机制</div>
+                  <div>
+                    推荐使用 GCP Application Default Credentials（ADC）/ Workload Identity / 容器 secret 让进程自动获取 GCP 凭据。
+                    项目和区域等非敏感配置（例如
+                    <code className="bg-muted px-1 rounded mx-1">ANTHROPIC_VERTEX_PROJECT_ID</code>、
+                    <code className="bg-muted px-1 rounded">CLOUD_ML_REGION</code>）可填到下方「自定义环境变量」。
+                  </div>
+                  <div>
+                    自定义环境变量在 GET 接口中以脱敏形式回显，但仍以加密形式持久化。
+                    长期 service account JSON 文件路径请确保对应文件本身在容器中受访问控制保护。
+                  </div>
                   <div>
                     HappyClaw 会自动注入 <code className="bg-muted px-1 rounded">CLAUDE_CODE_USE_VERTEX=1</code>。
                   </div>
                 </div>
               )}
 
-              {/* vertex_gateway：Base URL（必填）+ customEnv 提示 */}
+              {/* vertex_gateway：Base URL（必填）+ 专用 Auth Token + customEnv 提示 */}
               {thirdPartyBackend === 'vertex_gateway' && (
                 <>
                   <div>
@@ -906,9 +1123,58 @@ export function ProviderEditor({
                       placeholder="https://litellm.example.com/vertex"
                     />
                   </div>
+
+                  <div>
+                    <label className="block text-xs text-muted-foreground mb-1">
+                      Auth Token（网关认证，注入为 ANTHROPIC_AUTH_TOKEN）
+                      {!isCreate && provider?.hasAnthropicAuthToken
+                        ? ` (${provider.anthropicAuthTokenMasked})`
+                        : ''}
+                    </label>
+                    <Input
+                      type="password"
+                      value={authToken}
+                      onChange={(e) => {
+                        setAuthToken(e.target.value);
+                        setAuthTokenDirty(true);
+                        setClearTokenOnSave(false);
+                      }}
+                      disabled={saving || clearTokenOnSave}
+                      placeholder={
+                        isCreate
+                          ? '可选 — 网关要求 ANTHROPIC_AUTH_TOKEN 时填入'
+                          : provider?.hasAnthropicAuthToken
+                            ? '留空不变；输入新值覆盖'
+                            : '可选 — 网关要求 ANTHROPIC_AUTH_TOKEN 时填入'
+                      }
+                    />
+                    <p className="text-[11px] text-muted-foreground mt-1">
+                      网关 token 通过此专用字段加密存储，<strong>不要</strong>在下方「自定义环境变量」里再次填写
+                      <code className="bg-muted px-1 rounded mx-1">ANTHROPIC_AUTH_TOKEN</code>。
+                    </p>
+                    {!isCreate && provider?.hasAnthropicAuthToken && (
+                      <label className="mt-2 inline-flex items-center gap-2 text-xs text-muted-foreground">
+                        <input
+                          type="checkbox"
+                          checked={clearTokenOnSave}
+                          onChange={(e) => {
+                            setClearTokenOnSave(e.target.checked);
+                            if (e.target.checked) {
+                              setAuthToken('');
+                              setAuthTokenDirty(false);
+                            }
+                          }}
+                          disabled={saving}
+                        />
+                        保存时清空当前 Token
+                      </label>
+                    )}
+                  </div>
+
                   <div className="rounded-md border border-amber-200 bg-amber-50/50 dark:bg-amber-950/30 p-3 text-xs text-amber-800 dark:text-amber-300 space-y-1">
-                    <div className="font-medium">GCP project / region / token 通过自定义环境变量透传</div>
-                    <div>请参考 LiteLLM 等网关文档，把 project_id、region、token 填到下方「自定义环境变量」。</div>
+                    <div>
+                      GCP project / region 等非敏感变量可填到下方「自定义环境变量」。
+                    </div>
                     <div>
                       HappyClaw 会自动注入
                       <code className="bg-muted px-1 rounded mx-1">CLAUDE_CODE_USE_VERTEX=1</code>
@@ -1047,39 +1313,52 @@ export function ProviderEditor({
               </button>
             </div>
             <p className="mb-2 text-xs text-muted-foreground">
-              这些变量仅在当前提供商生效，不同提供商互不影响。
+              这些变量仅在当前提供商生效，不同提供商互不影响。已存在的变量值以脱敏形式显示
+              （<code className="bg-muted px-1 rounded">{MASKED_VALUE_PLACEHOLDER}</code>），
+              <strong>未修改的行</strong>保存时不会被覆盖；输入新值或修改 key 即视为更新该条目。
             </p>
 
             {customEnvRows.length === 0 ? (
               <p className="text-xs text-muted-foreground">暂无</p>
             ) : (
               <div className="space-y-2">
-                {customEnvRows.map((row, idx) => (
-                  <div key={idx} className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
-                    <Input
-                      type="text"
-                      value={row.key}
-                      onChange={(e) => updateRow(idx, 'key', e.target.value)}
-                      placeholder="KEY"
-                      className="w-full sm:w-[38%] px-2.5 py-1.5 text-xs font-mono h-auto"
-                    />
-                    <Input
-                      type="text"
-                      value={row.value}
-                      onChange={(e) => updateRow(idx, 'value', e.target.value)}
-                      placeholder="value"
-                      className="flex-1 px-2.5 py-1.5 text-xs font-mono h-auto"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => removeRow(idx)}
-                      className="w-8 h-8 rounded-md hover:bg-muted text-muted-foreground hover:text-red-500 flex items-center justify-center cursor-pointer"
-                      aria-label="删除环境变量"
-                    >
-                      <X className="w-4 h-4" />
-                    </button>
-                  </div>
-                ))}
+                {customEnvRows.map((row, idx) => {
+                  const isMaskedPlaceholder =
+                    row.value === MASKED_VALUE_PLACEHOLDER && !row.dirty;
+                  return (
+                    <div key={idx} className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                      <Input
+                        type="text"
+                        value={row.key}
+                        onChange={(e) => updateRow(idx, 'key', e.target.value)}
+                        placeholder="KEY"
+                        className="w-full sm:w-[38%] px-2.5 py-1.5 text-xs font-mono h-auto"
+                      />
+                      <Input
+                        type="text"
+                        value={row.value}
+                        onChange={(e) => updateRow(idx, 'value', e.target.value)}
+                        title={
+                          isMaskedPlaceholder
+                            ? '已存值（脱敏）— 点击该输入框并输入新值即视为修改；不修改则保留此占位符'
+                            : undefined
+                        }
+                        placeholder="value"
+                        className={`flex-1 px-2.5 py-1.5 text-xs font-mono h-auto ${
+                          isMaskedPlaceholder ? 'text-muted-foreground italic' : ''
+                        }`}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => removeRow(idx)}
+                        className="w-8 h-8 rounded-md hover:bg-muted text-muted-foreground hover:text-red-500 flex items-center justify-center cursor-pointer"
+                        aria-label="删除环境变量"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>

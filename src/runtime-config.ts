@@ -462,7 +462,18 @@ export interface UnifiedProviderPublic {
   hasClaudeOAuthCredentials: boolean;
   claudeOAuthCredentialsExpiresAt: number | null;
   claudeOAuthCredentialsAccessTokenMasked: string | null;
-  customEnv: Record<string, string>;
+  /**
+   * Custom env values exposed in masked form (each value run through
+   * {@link maskSecret}). Replaces the previous plaintext `customEnv` field
+   * which leaked AWS / gateway tokens via `GET /claude/providers`.
+   *
+   * Frontend must treat these strings as display-only — they are NOT real
+   * credentials and must never be sent back as a value (see `customEnvPatch`
+   * merge semantics on the patch endpoint).
+   */
+  customEnvMasked: Record<string, string>;
+  /** Stable list of customEnv keys (kept for legacy UIs that only need names). */
+  customEnvKeys: string[];
   updatedAt: string;
 }
 
@@ -1773,7 +1784,24 @@ export function updateProvider(
     disableExperimentalBetas?: boolean;
     anthropicBaseUrl?: string;
     anthropicModel?: string;
+    /**
+     * Full replacement of customEnv (legacy semantic). Prefer `customEnvPatch`
+     * — it preserves existing keys when the frontend only displays masked
+     * values and lets clients explicitly delete a key with `null`.
+     */
     customEnv?: Record<string, string>;
+    /**
+     * Merge-patch for customEnv. Each entry is applied on top of the stored
+     * map: a string value adds/overwrites the key, `null` deletes it, and
+     * keys absent from the patch keep their stored value untouched.
+     *
+     * This is the safe path when the frontend renders customEnv values as
+     * masked strings (see {@link toPublicProvider}) — sending a full
+     * `customEnv` would round-trip masks back as plaintext and clobber the
+     * real secrets. `customEnvPatch` lets the UI submit only what the user
+     * actually changed.
+     */
+    customEnvPatch?: Record<string, string | null>;
     weight?: number;
   },
 ): UnifiedProvider {
@@ -1784,6 +1812,29 @@ export function updateProvider(
   if (idx < 0) throw new Error('未找到指定供应商');
 
   const current = state.providers[idx];
+
+  // Resolve the next customEnv: full replacement wins over patch when both
+  // are provided (defensive — schema rejects this combo, but keeps the
+  // helper safe for direct callers).
+  let nextCustomEnv: Record<string, string> | undefined;
+  if (patch.customEnv !== undefined) {
+    nextCustomEnv = sanitizeCustomEnvMap(patch.customEnv, {
+      skipReservedClaudeKeys: true,
+    });
+  } else if (patch.customEnvPatch !== undefined) {
+    const merged: Record<string, string> = { ...(current.customEnv || {}) };
+    for (const [key, value] of Object.entries(patch.customEnvPatch)) {
+      if (value === null) {
+        delete merged[key];
+      } else {
+        merged[key] = value;
+      }
+    }
+    nextCustomEnv = sanitizeCustomEnvMap(merged, {
+      skipReservedClaudeKeys: true,
+    });
+  }
+
   const updated: UnifiedProvider = {
     ...current,
     backend:
@@ -1800,13 +1851,7 @@ export function updateProvider(
     ...(patch.anthropicModel !== undefined
       ? { anthropicModel: normalizeModel(patch.anthropicModel) }
       : {}),
-    ...(patch.customEnv !== undefined
-      ? {
-          customEnv: sanitizeCustomEnvMap(patch.customEnv, {
-            skipReservedClaudeKeys: true,
-          }),
-        }
-      : {}),
+    ...(nextCustomEnv !== undefined ? { customEnv: nextCustomEnv } : {}),
     ...(patch.weight !== undefined
       ? { weight: Math.max(1, Math.min(100, patch.weight)) }
       : {}),
@@ -1983,9 +2028,23 @@ export function toPublicProvider(
     claudeOAuthCredentialsAccessTokenMasked: provider.claudeOAuthCredentials
       ? maskSecret(provider.claudeOAuthCredentials.accessToken)
       : null,
-    customEnv: provider.customEnv || {},
+    customEnvMasked: maskCustomEnv(provider.customEnv || {}),
+    customEnvKeys: Object.keys(provider.customEnv || {}),
     updatedAt: provider.updatedAt,
   };
+}
+
+/**
+ * Mask every value in a customEnv map. Values that maskSecret returns null for
+ * (only when the source is empty) are exposed as the literal placeholder so
+ * the frontend can still render the key/value table cleanly.
+ */
+function maskCustomEnv(map: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(map)) {
+    out[k] = maskSecret(v) ?? '';
+  }
+  return out;
 }
 
 /**

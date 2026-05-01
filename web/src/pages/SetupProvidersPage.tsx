@@ -76,7 +76,10 @@ function buildCustomEnv(rows: EnvRow[]): { customEnv: Record<string, string>; er
       return { customEnv: {}, error: `环境变量 Key "${key}" 格式无效（仅允许大写字母/数字/下划线，且不能数字开头）` };
     }
     if (RESERVED_ENV_KEYS.has(key)) {
-      return { customEnv: {}, error: `${key} 属于系统保留字段，请在必填区域填写` };
+      return {
+        customEnv: {},
+        error: `${key} 已有专用配置区，不要在自定义环境变量表中重复填写`,
+      };
     }
     if (customEnv[key] !== undefined) {
       return { customEnv: {}, error: `环境变量 Key "${key}" 重复` };
@@ -636,18 +639,20 @@ export function SetupProvidersPage() {
                 </div>
               )}
 
-              {/* bedrock 直连 */}
+              {/* bedrock 直连 — 凭据走运维侧机制，不推荐 secret 入 customEnv */}
               {thirdPartyBackend === 'bedrock' && (
                 <div className="grid grid-cols-1 gap-3">
                   <div className="rounded-md border border-amber-200 bg-amber-50/50 dark:bg-amber-950/30 p-3 text-xs text-amber-800 dark:text-amber-300 space-y-1">
-                    <div className="font-medium">AWS 凭据通过自定义环境变量透传</div>
-                    <div>把以下 env 之一填到下方「自定义环境变量」：</div>
-                    <ul className="list-disc ml-5 space-y-0.5">
-                      <li><code className="bg-muted px-1 rounded">AWS_REGION</code>（必填，例如 us-east-1）</li>
-                      <li><code className="bg-muted px-1 rounded">AWS_PROFILE</code></li>
-                      <li><code className="bg-muted px-1 rounded">AWS_ACCESS_KEY_ID</code> + <code className="bg-muted px-1 rounded">AWS_SECRET_ACCESS_KEY</code></li>
-                      <li><code className="bg-muted px-1 rounded">AWS_BEARER_TOKEN_BEDROCK</code></li>
-                    </ul>
+                    <div className="font-medium">直连 AWS Bedrock — 凭据建议走运维侧机制</div>
+                    <div>
+                      推荐使用 IAM Role / EC2 instance profile / 容器 secret 让进程自动获取 AWS 凭据。
+                      非敏感配置（例如 <code className="bg-muted px-1 rounded">AWS_REGION</code>、
+                      <code className="bg-muted px-1 rounded mx-1">AWS_PROFILE</code>）可填到下方「自定义环境变量」。
+                    </div>
+                    <div>
+                      自定义环境变量在 GET 接口中以脱敏形式回显，仍以加密形式持久化。
+                      长期 access key / secret 请尽量用 IAM 短期凭据替代。
+                    </div>
                     <div>HappyClaw 自动注入 <code className="bg-muted px-1 rounded">CLAUDE_CODE_USE_BEDROCK=1</code>。</div>
                   </div>
                   <div>
@@ -663,7 +668,7 @@ export function SetupProvidersPage() {
                 </div>
               )}
 
-              {/* bedrock_gateway */}
+              {/* bedrock_gateway — Base URL + 专用 Auth Token */}
               {thirdPartyBackend === 'bedrock_gateway' && (
                 <div className="grid grid-cols-1 gap-3">
                   <div>
@@ -681,6 +686,21 @@ export function SetupProvidersPage() {
                     />
                   </div>
                   <div>
+                    <label className="block text-sm font-medium text-foreground mb-1">
+                      Auth Token（可选，注入为 ANTHROPIC_AUTH_TOKEN）
+                    </label>
+                    <Input
+                      type="password"
+                      value={authToken}
+                      onChange={(e) => setAuthToken(e.target.value)}
+                      placeholder="网关要求 ANTHROPIC_AUTH_TOKEN 时填入"
+                    />
+                    <p className="text-[11px] text-muted-foreground mt-1">
+                      网关 token 通过此专用字段加密存储，<strong>不要</strong>在下方「自定义环境变量」里再次填写
+                      <code className="bg-muted px-1 rounded mx-1">ANTHROPIC_AUTH_TOKEN</code>。
+                    </p>
+                  </div>
+                  <div>
                     <label className="block text-sm font-medium text-foreground mb-1">ANTHROPIC_MODEL（可选）</label>
                     <Input
                       type="text"
@@ -691,10 +711,9 @@ export function SetupProvidersPage() {
                     />
                   </div>
                   <div className="rounded-md border border-amber-200 bg-amber-50/50 dark:bg-amber-950/30 p-3 text-xs text-amber-800 dark:text-amber-300 space-y-1">
-                    <div className="font-medium">网关 Token 通过自定义环境变量透传</div>
                     <div>
-                      参考 LiteLLM/one-api 文档把认证 env（通常 <code className="bg-muted px-1 rounded">ANTHROPIC_AUTH_TOKEN</code> 或
-                      <code className="bg-muted px-1 rounded">AWS_BEARER_TOKEN_BEDROCK</code>）填到下方「自定义环境变量」。
+                      其他网关专属变量（例如 <code className="bg-muted px-1 rounded">AWS_BEARER_TOKEN_BEDROCK</code>）
+                      可填到下方「自定义环境变量」。
                     </div>
                     <div>
                       自动注入 <code className="bg-muted px-1 rounded">CLAUDE_CODE_USE_BEDROCK=1</code> +
@@ -704,16 +723,20 @@ export function SetupProvidersPage() {
                 </div>
               )}
 
-              {/* vertex 直连 */}
+              {/* vertex 直连 — 凭据走 ADC，不推荐 secret 入 customEnv */}
               {thirdPartyBackend === 'vertex' && (
                 <div className="grid grid-cols-1 gap-3">
                   <div className="rounded-md border border-amber-200 bg-amber-50/50 dark:bg-amber-950/30 p-3 text-xs text-amber-800 dark:text-amber-300 space-y-1">
-                    <div className="font-medium">GCP 凭据通过自定义环境变量透传</div>
-                    <ul className="list-disc ml-5 space-y-0.5">
-                      <li><code className="bg-muted px-1 rounded">ANTHROPIC_VERTEX_PROJECT_ID</code></li>
-                      <li><code className="bg-muted px-1 rounded">CLOUD_ML_REGION</code></li>
-                      <li><code className="bg-muted px-1 rounded">GOOGLE_APPLICATION_CREDENTIALS</code></li>
-                    </ul>
+                    <div className="font-medium">直连 GCP Vertex — 凭据建议走运维侧机制</div>
+                    <div>
+                      推荐使用 GCP Application Default Credentials（ADC） / Workload Identity / 容器 secret 让进程自动获取凭据。
+                      非敏感的项目和区域配置（<code className="bg-muted px-1 rounded mx-1">ANTHROPIC_VERTEX_PROJECT_ID</code>、
+                      <code className="bg-muted px-1 rounded">CLOUD_ML_REGION</code>）可填到下方「自定义环境变量」。
+                    </div>
+                    <div>
+                      自定义环境变量在 GET 接口中以脱敏形式回显，仍以加密形式持久化。
+                      长期 service account JSON 文件请确保对应文件本身在容器中受访问控制保护。
+                    </div>
                     <div>自动注入 <code className="bg-muted px-1 rounded">CLAUDE_CODE_USE_VERTEX=1</code>。</div>
                   </div>
                   <div>
@@ -729,7 +752,7 @@ export function SetupProvidersPage() {
                 </div>
               )}
 
-              {/* vertex_gateway */}
+              {/* vertex_gateway — Base URL + 专用 Auth Token */}
               {thirdPartyBackend === 'vertex_gateway' && (
                 <div className="grid grid-cols-1 gap-3">
                   <div>
@@ -747,6 +770,21 @@ export function SetupProvidersPage() {
                     />
                   </div>
                   <div>
+                    <label className="block text-sm font-medium text-foreground mb-1">
+                      Auth Token（可选，注入为 ANTHROPIC_AUTH_TOKEN）
+                    </label>
+                    <Input
+                      type="password"
+                      value={authToken}
+                      onChange={(e) => setAuthToken(e.target.value)}
+                      placeholder="网关要求 ANTHROPIC_AUTH_TOKEN 时填入"
+                    />
+                    <p className="text-[11px] text-muted-foreground mt-1">
+                      网关 token 通过此专用字段加密存储，<strong>不要</strong>在下方「自定义环境变量」里再次填写
+                      <code className="bg-muted px-1 rounded mx-1">ANTHROPIC_AUTH_TOKEN</code>。
+                    </p>
+                  </div>
+                  <div>
                     <label className="block text-sm font-medium text-foreground mb-1">ANTHROPIC_MODEL（可选）</label>
                     <Input
                       type="text"
@@ -757,8 +795,8 @@ export function SetupProvidersPage() {
                     />
                   </div>
                   <div className="rounded-md border border-amber-200 bg-amber-50/50 dark:bg-amber-950/30 p-3 text-xs text-amber-800 dark:text-amber-300 space-y-1">
-                    GCP project_id / region / token 通过自定义环境变量透传。自动注入
-                    <code className="bg-muted px-1 rounded mx-1">CLAUDE_CODE_USE_VERTEX=1</code>
+                    GCP project / region 等非敏感变量可填到下方「自定义环境变量」。
+                    自动注入 <code className="bg-muted px-1 rounded mx-1">CLAUDE_CODE_USE_VERTEX=1</code>
                     + <code className="bg-muted px-1 rounded">CLAUDE_CODE_SKIP_VERTEX_AUTH=1</code>。
                   </div>
                 </div>

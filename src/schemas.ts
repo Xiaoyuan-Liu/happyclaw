@@ -672,7 +672,20 @@ export const UnifiedProviderPatchSchema = z
     disableExperimentalBetas: z.boolean().optional(),
     anthropicBaseUrl: z.string().max(2000).optional(),
     anthropicModel: z.string().max(128).optional(),
+    /**
+     * Full replacement of customEnv (legacy semantic). Prefer `customEnvPatch`
+     * for UIs that render values as masked strings — sending masks back here
+     * would clobber the real secrets.
+     */
     customEnv: z.record(z.string().max(256), z.string().max(4096)).optional(),
+    /**
+     * Merge-patch for customEnv. Each entry adds/overwrites a key (string
+     * value) or deletes it (null). Keys absent from the patch keep their
+     * stored value untouched.
+     */
+    customEnvPatch: z
+      .record(z.string().max(256), z.union([z.string().max(4096), z.null()]))
+      .optional(),
     weight: z.number().int().min(1).max(100).optional(),
   })
   .superRefine((data, ctx) => {
@@ -703,6 +716,14 @@ export const UnifiedProviderPatchSchema = z
           'Vertex 网关后端必须提供 Base URL（用作 ANTHROPIC_VERTEX_BASE_URL）',
       });
     }
+    if (data.customEnv !== undefined && data.customEnvPatch !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['customEnvPatch'],
+        message:
+          'customEnv 与 customEnvPatch 不能同时提交，请选择全量替换或合并补丁其中一种语义',
+      });
+    }
   })
   .refine(
     (data) =>
@@ -712,6 +733,7 @@ export const UnifiedProviderPatchSchema = z
       data.anthropicBaseUrl !== undefined ||
       data.anthropicModel !== undefined ||
       data.customEnv !== undefined ||
+      data.customEnvPatch !== undefined ||
       data.weight !== undefined,
     { message: 'At least one field must be provided' },
   );
