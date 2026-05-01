@@ -8,11 +8,52 @@ import { api } from '../api/client';
 import type {
   UnifiedProviderPublic,
   EnvRow,
+  ProviderBackend,
 } from '../components/settings/types';
 import { getErrorMessage } from '../components/settings/types';
 import { useAuthStore } from '../stores/auth';
 
 type ProviderMode = 'official' | 'third_party';
+type ThirdPartyBackend = Exclude<ProviderBackend, 'anthropic_official'>;
+
+interface ThirdPartyBackendOption {
+  value: ThirdPartyBackend;
+  label: string;
+  description: string;
+}
+
+const THIRD_PARTY_BACKEND_OPTIONS: ThirdPartyBackendOption[] = [
+  {
+    value: 'anthropic_messages',
+    label: 'Anthropic Messages 兼容网关',
+    description: 'GLM / Minimax / OpenAI-compatible 网关 → LiteLLM/one-api 等',
+  },
+  {
+    value: 'bedrock',
+    label: 'Amazon Bedrock 直连',
+    description: '通过 AWS 凭据直接调用 Bedrock',
+  },
+  {
+    value: 'bedrock_gateway',
+    label: 'Amazon Bedrock via 网关',
+    description: 'LiteLLM 等代理 → Bedrock',
+  },
+  {
+    value: 'vertex',
+    label: 'Google Vertex AI 直连',
+    description: '通过 GCP 凭据直接调用 Vertex',
+  },
+  {
+    value: 'vertex_gateway',
+    label: 'Google Vertex AI via 网关',
+    description: 'LiteLLM 等代理 → Vertex',
+  },
+  {
+    value: 'foundry',
+    label: 'Microsoft Foundry',
+    description: 'Azure / Foundry endpoints',
+  },
+];
 
 const RESERVED_ENV_KEYS = new Set([
   'ANTHROPIC_BASE_URL',
@@ -72,8 +113,12 @@ export function SetupProvidersPage() {
   const [oauthDone, setOauthDone] = useState(false);
 
   // Third-party mode
+  const [thirdPartyBackend, setThirdPartyBackend] =
+    useState<ThirdPartyBackend>('anthropic_messages');
+  const [disableExperimentalBetas, setDisableExperimentalBetas] = useState(false);
   const [baseUrl, setBaseUrl] = useState('');
   const [authToken, setAuthToken] = useState('');
+  const [thirdPartyApiKey, setThirdPartyApiKey] = useState('');
   const [model, setModel] = useState('');
   const [customEnvRows, setCustomEnvRows] = useState<EnvRow[]>([]);
 
@@ -149,14 +194,33 @@ export function SetupProvidersPage() {
 
     let customEnv: Record<string, string> = {};
     if (providerMode === 'third_party') {
-      if (!baseUrl.trim()) {
-        setError('第三方渠道必须填写 ANTHROPIC_BASE_URL');
-        return;
+      // backend-specific 必填校验
+      if (thirdPartyBackend === 'anthropic_messages') {
+        if (!baseUrl.trim()) {
+          setError('Anthropic 兼容网关必须填写 Base URL');
+          return;
+        }
+        if (!authToken.trim()) {
+          setError('Anthropic 兼容网关必须填写 Auth Token');
+          return;
+        }
+      } else if (thirdPartyBackend === 'bedrock_gateway') {
+        if (!baseUrl.trim()) {
+          setError('Bedrock 网关必须填写 Base URL（用作 ANTHROPIC_BEDROCK_BASE_URL）');
+          return;
+        }
+      } else if (thirdPartyBackend === 'vertex_gateway') {
+        if (!baseUrl.trim()) {
+          setError('Vertex 网关必须填写 Base URL（用作 ANTHROPIC_VERTEX_BASE_URL）');
+          return;
+        }
+      } else if (thirdPartyBackend === 'foundry') {
+        if (!authToken.trim() && !thirdPartyApiKey.trim()) {
+          setError('Foundry 后端必须提供 API Key 或 Auth Token');
+          return;
+        }
       }
-      if (!authToken.trim()) {
-        setError('第三方渠道必须填写 ANTHROPIC_AUTH_TOKEN');
-        return;
-      }
+      // bedrock / vertex 直连：凭据全部走 customEnv，无前置必填
       const envResult = buildCustomEnv(customEnvRows);
       if (envResult.error) {
         setError(envResult.error);
@@ -227,17 +291,28 @@ export function SetupProvidersPage() {
           }
         }
       } else {
+        const thirdPartyBody: Record<string, unknown> = {
+          name: '默认第三方',
+          type: 'third_party',
+          backend: thirdPartyBackend,
+          customEnv,
+          enabled: true,
+        };
+        if (baseUrl.trim()) thirdPartyBody.anthropicBaseUrl = baseUrl.trim();
+        if (authToken.trim()) thirdPartyBody.anthropicAuthToken = authToken.trim();
+        if (thirdPartyBackend === 'foundry' && thirdPartyApiKey.trim()) {
+          thirdPartyBody.anthropicApiKey = thirdPartyApiKey.trim();
+        }
+        if (model.trim()) thirdPartyBody.anthropicModel = model.trim();
+        if (
+          thirdPartyBackend === 'anthropic_messages' &&
+          disableExperimentalBetas
+        ) {
+          thirdPartyBody.disableExperimentalBetas = true;
+        }
         await api.post<UnifiedProviderPublic>(
           '/api/config/claude/providers',
-          {
-            name: '默认第三方',
-            type: 'third_party',
-            anthropicBaseUrl: baseUrl.trim(),
-            anthropicAuthToken: authToken.trim(),
-            anthropicModel: model.trim(),
-            customEnv,
-            enabled: true,
-          },
+          thirdPartyBody,
         );
       }
 
@@ -482,41 +557,261 @@ export function SetupProvidersPage() {
             <div className="space-y-4">
               <div className="flex items-center gap-2 text-xs text-muted-foreground">
                 <Server className="w-4 h-4 text-primary" />
-                第三方渠道会写入系统全局默认环境变量。必填项为 ANTHROPIC_BASE_URL 和 ANTHROPIC_AUTH_TOKEN。
+                第三方渠道会写入系统全局默认环境变量。请先选择 backend 类型，不同 backend 的必填项不同。
               </div>
 
-              <div className="grid grid-cols-1 gap-3">
-                <div>
-                  <label className="block text-sm font-medium text-foreground mb-1">ANTHROPIC_BASE_URL（必填）</label>
-                  <Input
-                    type="text"
-                    value={baseUrl}
-                    onChange={(e) => setBaseUrl(e.target.value)}
-                    placeholder="https://your-relay.example.com/v1"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-sm font-medium text-foreground mb-1">ANTHROPIC_MODEL（可选）</label>
-                  <Input
-                    type="text"
-                    value={model}
-                    onChange={(e) => setModel(e.target.value)}
-                    placeholder="opus[1m] / opus / sonnet[1m] / sonnet / haiku"
-                    className="font-mono"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-sm font-medium text-foreground mb-1">ANTHROPIC_AUTH_TOKEN（必填）</label>
-                  <Input
-                    type="password"
-                    value={authToken}
-                    onChange={(e) => setAuthToken(e.target.value)}
-                    placeholder="输入第三方网关 Token"
-                  />
-                </div>
+              {/* 第二级 backend 选择 */}
+              <div>
+                <label className="block text-sm font-medium text-foreground mb-1">Backend 类型</label>
+                <select
+                  value={thirdPartyBackend}
+                  onChange={(e) => setThirdPartyBackend(e.target.value as ThirdPartyBackend)}
+                  className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary/30"
+                >
+                  {THIRD_PARTY_BACKEND_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-xs text-muted-foreground mt-1">
+                  {THIRD_PARTY_BACKEND_OPTIONS.find((o) => o.value === thirdPartyBackend)?.description}
+                </p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  不确定？大多数第三方 OpenAI/Claude 兼容网关（GLM、Minimax、LiteLLM unified
+                  等）选「Anthropic 兼容网关」，并建议勾选兼容模式。
+                </p>
               </div>
+
+              {/* anthropic_messages */}
+              {thirdPartyBackend === 'anthropic_messages' && (
+                <div className="grid grid-cols-1 gap-3">
+                  <div>
+                    <label className="block text-sm font-medium text-foreground mb-1">
+                      ANTHROPIC_BASE_URL <span className="text-red-500">*</span>
+                    </label>
+                    <Input
+                      type="text"
+                      value={baseUrl}
+                      onChange={(e) => setBaseUrl(e.target.value)}
+                      placeholder="https://your-relay.example.com/v1"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-foreground mb-1">ANTHROPIC_MODEL（可选）</label>
+                    <Input
+                      type="text"
+                      value={model}
+                      onChange={(e) => setModel(e.target.value)}
+                      placeholder="opus[1m] / opus / sonnet[1m] / sonnet / haiku"
+                      className="font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-foreground mb-1">
+                      ANTHROPIC_AUTH_TOKEN <span className="text-red-500">*</span>
+                    </label>
+                    <Input
+                      type="password"
+                      value={authToken}
+                      onChange={(e) => setAuthToken(e.target.value)}
+                      placeholder="输入第三方网关 Token"
+                    />
+                  </div>
+                  <label className="inline-flex items-start gap-2 text-xs text-muted-foreground">
+                    <input
+                      type="checkbox"
+                      checked={disableExperimentalBetas}
+                      onChange={(e) => setDisableExperimentalBetas(e.target.checked)}
+                      className="mt-0.5"
+                    />
+                    <span>
+                      禁用实验 beta（兼容老网关）
+                      <span className="block text-[11px] text-muted-foreground mt-0.5">
+                        注入 <code className="bg-muted px-1 rounded">CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1</code>。
+                        如果第三方网关报错 "Unsupported beta header"，请勾选。
+                      </span>
+                    </span>
+                  </label>
+                </div>
+              )}
+
+              {/* bedrock 直连 */}
+              {thirdPartyBackend === 'bedrock' && (
+                <div className="grid grid-cols-1 gap-3">
+                  <div className="rounded-md border border-amber-200 bg-amber-50/50 dark:bg-amber-950/30 p-3 text-xs text-amber-800 dark:text-amber-300 space-y-1">
+                    <div className="font-medium">AWS 凭据通过自定义环境变量透传</div>
+                    <div>把以下 env 之一填到下方「自定义环境变量」：</div>
+                    <ul className="list-disc ml-5 space-y-0.5">
+                      <li><code className="bg-muted px-1 rounded">AWS_REGION</code>（必填，例如 us-east-1）</li>
+                      <li><code className="bg-muted px-1 rounded">AWS_PROFILE</code></li>
+                      <li><code className="bg-muted px-1 rounded">AWS_ACCESS_KEY_ID</code> + <code className="bg-muted px-1 rounded">AWS_SECRET_ACCESS_KEY</code></li>
+                      <li><code className="bg-muted px-1 rounded">AWS_BEARER_TOKEN_BEDROCK</code></li>
+                    </ul>
+                    <div>HappyClaw 自动注入 <code className="bg-muted px-1 rounded">CLAUDE_CODE_USE_BEDROCK=1</code>。</div>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-foreground mb-1">ANTHROPIC_MODEL（可选）</label>
+                    <Input
+                      type="text"
+                      value={model}
+                      onChange={(e) => setModel(e.target.value)}
+                      placeholder="anthropic.claude-3-5-sonnet-20241022-v2:0"
+                      className="font-mono"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* bedrock_gateway */}
+              {thirdPartyBackend === 'bedrock_gateway' && (
+                <div className="grid grid-cols-1 gap-3">
+                  <div>
+                    <label className="block text-sm font-medium text-foreground mb-1">
+                      Base URL <span className="text-red-500">*</span>
+                      <span className="block text-[11px] text-muted-foreground">
+                        用作 ANTHROPIC_BEDROCK_BASE_URL
+                      </span>
+                    </label>
+                    <Input
+                      type="text"
+                      value={baseUrl}
+                      onChange={(e) => setBaseUrl(e.target.value)}
+                      placeholder="https://litellm.example.com/bedrock"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-foreground mb-1">ANTHROPIC_MODEL（可选）</label>
+                    <Input
+                      type="text"
+                      value={model}
+                      onChange={(e) => setModel(e.target.value)}
+                      placeholder="网关支持的 Bedrock 模型 ID"
+                      className="font-mono"
+                    />
+                  </div>
+                  <div className="rounded-md border border-amber-200 bg-amber-50/50 dark:bg-amber-950/30 p-3 text-xs text-amber-800 dark:text-amber-300 space-y-1">
+                    <div className="font-medium">网关 Token 通过自定义环境变量透传</div>
+                    <div>
+                      参考 LiteLLM/one-api 文档把认证 env（通常 <code className="bg-muted px-1 rounded">ANTHROPIC_AUTH_TOKEN</code> 或
+                      <code className="bg-muted px-1 rounded">AWS_BEARER_TOKEN_BEDROCK</code>）填到下方「自定义环境变量」。
+                    </div>
+                    <div>
+                      自动注入 <code className="bg-muted px-1 rounded">CLAUDE_CODE_USE_BEDROCK=1</code> +
+                      <code className="bg-muted px-1 rounded mx-1">CLAUDE_CODE_SKIP_BEDROCK_AUTH=1</code>。
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* vertex 直连 */}
+              {thirdPartyBackend === 'vertex' && (
+                <div className="grid grid-cols-1 gap-3">
+                  <div className="rounded-md border border-amber-200 bg-amber-50/50 dark:bg-amber-950/30 p-3 text-xs text-amber-800 dark:text-amber-300 space-y-1">
+                    <div className="font-medium">GCP 凭据通过自定义环境变量透传</div>
+                    <ul className="list-disc ml-5 space-y-0.5">
+                      <li><code className="bg-muted px-1 rounded">ANTHROPIC_VERTEX_PROJECT_ID</code></li>
+                      <li><code className="bg-muted px-1 rounded">CLOUD_ML_REGION</code></li>
+                      <li><code className="bg-muted px-1 rounded">GOOGLE_APPLICATION_CREDENTIALS</code></li>
+                    </ul>
+                    <div>自动注入 <code className="bg-muted px-1 rounded">CLAUDE_CODE_USE_VERTEX=1</code>。</div>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-foreground mb-1">ANTHROPIC_MODEL（可选）</label>
+                    <Input
+                      type="text"
+                      value={model}
+                      onChange={(e) => setModel(e.target.value)}
+                      placeholder="claude-3-5-sonnet-v2@20241022"
+                      className="font-mono"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* vertex_gateway */}
+              {thirdPartyBackend === 'vertex_gateway' && (
+                <div className="grid grid-cols-1 gap-3">
+                  <div>
+                    <label className="block text-sm font-medium text-foreground mb-1">
+                      Base URL <span className="text-red-500">*</span>
+                      <span className="block text-[11px] text-muted-foreground">
+                        用作 ANTHROPIC_VERTEX_BASE_URL
+                      </span>
+                    </label>
+                    <Input
+                      type="text"
+                      value={baseUrl}
+                      onChange={(e) => setBaseUrl(e.target.value)}
+                      placeholder="https://litellm.example.com/vertex"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-foreground mb-1">ANTHROPIC_MODEL（可选）</label>
+                    <Input
+                      type="text"
+                      value={model}
+                      onChange={(e) => setModel(e.target.value)}
+                      placeholder="网关支持的 Vertex 模型 ID"
+                      className="font-mono"
+                    />
+                  </div>
+                  <div className="rounded-md border border-amber-200 bg-amber-50/50 dark:bg-amber-950/30 p-3 text-xs text-amber-800 dark:text-amber-300 space-y-1">
+                    GCP project_id / region / token 通过自定义环境变量透传。自动注入
+                    <code className="bg-muted px-1 rounded mx-1">CLAUDE_CODE_USE_VERTEX=1</code>
+                    + <code className="bg-muted px-1 rounded">CLAUDE_CODE_SKIP_VERTEX_AUTH=1</code>。
+                  </div>
+                </div>
+              )}
+
+              {/* foundry */}
+              {thirdPartyBackend === 'foundry' && (
+                <div className="grid grid-cols-1 gap-3">
+                  <div>
+                    <label className="block text-sm font-medium text-foreground mb-1">Base URL（可选）
+                      <span className="block text-[11px] text-muted-foreground">用作 ANTHROPIC_FOUNDRY_BASE_URL</span>
+                    </label>
+                    <Input
+                      type="text"
+                      value={baseUrl}
+                      onChange={(e) => setBaseUrl(e.target.value)}
+                      placeholder="https://your-foundry-resource.cognitiveservices.azure.com"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-foreground mb-1">
+                      API Key <span className="text-red-500">*</span>
+                      <span className="block text-[11px] text-muted-foreground">（与 Auth Token 二选一）</span>
+                    </label>
+                    <Input
+                      type="password"
+                      value={thirdPartyApiKey}
+                      onChange={(e) => setThirdPartyApiKey(e.target.value)}
+                      placeholder="输入 Foundry API Key"
+                      className="font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-foreground mb-1">Auth Token（可选）</label>
+                    <Input
+                      type="password"
+                      value={authToken}
+                      onChange={(e) => setAuthToken(e.target.value)}
+                      placeholder="输入 Auth Token"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-foreground mb-1">ANTHROPIC_MODEL（可选）</label>
+                    <Input
+                      type="text"
+                      value={model}
+                      onChange={(e) => setModel(e.target.value)}
+                      placeholder="Foundry 部署模型 ID"
+                      className="font-mono"
+                    />
+                  </div>
+                </div>
+              )}
 
               <div className="border-t border-border pt-4">
                 <div className="flex items-center justify-between mb-2">

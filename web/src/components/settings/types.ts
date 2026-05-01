@@ -1,9 +1,23 @@
-// ─── 统一供应商类型 (V4) ─────────────────────────────────────
+// ─── 统一供应商类型 (V5) ─────────────────────────────────────
+
+/** Backend 类型 — 决定 SDK env 如何注入 (与后端 ProviderBackend 保持一致) */
+export type ProviderBackend =
+  | 'anthropic_official'
+  | 'anthropic_messages'
+  | 'bedrock'
+  | 'bedrock_gateway'
+  | 'vertex'
+  | 'vertex_gateway'
+  | 'foundry';
 
 export interface UnifiedProviderPublic {
   id: string;
   name: string;
   type: 'official' | 'third_party';
+  /** V5 新增：明确 backend 分发路径 */
+  backend: ProviderBackend;
+  /** V5 新增：显式禁用实验 beta（兼容老网关） */
+  disableExperimentalBetas?: boolean;
   enabled: boolean;
   weight: number;
   anthropicBaseUrl: string;

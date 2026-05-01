@@ -11,11 +11,58 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/u
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { api } from '../../api/client';
-import type { ProviderWithHealth, EnvRow } from './types';
+import type { ProviderWithHealth, EnvRow, ProviderBackend } from './types';
 import { getErrorMessage } from './types';
 
 type ProviderType = 'official' | 'third_party';
 type OfficialAuthTab = 'oauth' | 'setup_token' | 'api_key';
+
+/** 第三方 backend 二级选项 — 第一级 official 自动映射到 anthropic_official */
+type ThirdPartyBackend = Exclude<ProviderBackend, 'anthropic_official'>;
+
+interface ThirdPartyBackendOption {
+  value: ThirdPartyBackend;
+  label: string;
+  description: string;
+}
+
+const THIRD_PARTY_BACKEND_OPTIONS: ThirdPartyBackendOption[] = [
+  {
+    value: 'anthropic_messages',
+    label: 'Anthropic Messages 兼容网关',
+    description: 'GLM / Minimax / OpenAI-compatible 网关 → LiteLLM/one-api 等',
+  },
+  {
+    value: 'bedrock',
+    label: 'Amazon Bedrock 直连',
+    description: '通过 AWS 凭据直接调用 Bedrock',
+  },
+  {
+    value: 'bedrock_gateway',
+    label: 'Amazon Bedrock via 网关',
+    description: 'LiteLLM 等代理 → Bedrock',
+  },
+  {
+    value: 'vertex',
+    label: 'Google Vertex AI 直连',
+    description: '通过 GCP 凭据直接调用 Vertex',
+  },
+  {
+    value: 'vertex_gateway',
+    label: 'Google Vertex AI via 网关',
+    description: 'LiteLLM 等代理 → Vertex',
+  },
+  {
+    value: 'foundry',
+    label: 'Microsoft Foundry',
+    description: 'Azure / Foundry endpoints',
+  },
+];
+
+/** 把 V5 backend 映射回第一级 ProviderType（兼容老 provider 编辑） */
+function deriveProviderType(backend: ProviderBackend | undefined): ProviderType {
+  return backend === 'anthropic_official' ? 'official' : 'third_party';
+}
 
 const RESERVED_ENV_KEYS = new Set([
   'ANTHROPIC_BASE_URL',
@@ -80,6 +127,9 @@ export function ProviderEditor({
 
   // 基础字段
   const [providerType, setProviderType] = useState<ProviderType>('third_party');
+  const [thirdPartyBackend, setThirdPartyBackend] =
+    useState<ThirdPartyBackend>('anthropic_messages');
+  const [disableExperimentalBetas, setDisableExperimentalBetas] = useState(false);
   const [name, setName] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
   const [model, setModel] = useState('');
@@ -113,6 +163,8 @@ export function ProviderEditor({
 
     if (isCreate) {
       setProviderType('third_party');
+      setThirdPartyBackend('anthropic_messages');
+      setDisableExperimentalBetas(false);
       setName('');
       setBaseUrl('');
       setModel('');
@@ -127,7 +179,18 @@ export function ProviderEditor({
       setClearTokenOnSave(false);
       setCustomEnvRows([]);
     } else {
-      setProviderType(provider.type);
+      const derivedType = deriveProviderType(provider.backend);
+      setProviderType(derivedType);
+      // 第三方时回填二级 backend；官方时保留默认（不会渲染）
+      if (derivedType === 'third_party') {
+        const backend = (provider.backend ?? 'anthropic_messages') as ProviderBackend;
+        setThirdPartyBackend(
+          backend === 'anthropic_official' ? 'anthropic_messages' : backend,
+        );
+      } else {
+        setThirdPartyBackend('anthropic_messages');
+      }
+      setDisableExperimentalBetas(!!provider.disableExperimentalBetas);
       setName(provider.name);
       setBaseUrl(provider.anthropicBaseUrl || '');
       setModel(provider.anthropicModel || '');
@@ -220,9 +283,13 @@ export function ProviderEditor({
     try {
       if (isCreate) {
         // ── 创建模式 ──
+        const finalBackend: ProviderBackend =
+          providerType === 'official' ? 'anthropic_official' : thirdPartyBackend;
+
         const createBody: Record<string, unknown> = {
           name: trimmedName,
           type: providerType,
+          backend: finalBackend,
           customEnv: envResult.customEnv,
           weight,
         };
@@ -230,18 +297,54 @@ export function ProviderEditor({
         if (providerType === 'third_party') {
           const trimmedBaseUrl = baseUrl.trim();
           const trimmedToken = authToken.trim();
-          if (!trimmedBaseUrl) {
-            setError('请填写 ANTHROPIC_BASE_URL');
-            setSaving(false);
-            return;
+
+          // backend-specific 必填校验（与后端 schema 对齐，提前给用户更友好的提示）
+          if (thirdPartyBackend === 'anthropic_messages') {
+            if (!trimmedBaseUrl) {
+              setError('请填写 ANTHROPIC_BASE_URL');
+              setSaving(false);
+              return;
+            }
+            if (!trimmedToken) {
+              setError('新建 Anthropic 兼容网关 provider 时必须填写 Auth Token');
+              setSaving(false);
+              return;
+            }
+          } else if (thirdPartyBackend === 'bedrock_gateway') {
+            if (!trimmedBaseUrl) {
+              setError('Bedrock 网关后端必须填写 Base URL（用作 ANTHROPIC_BEDROCK_BASE_URL）');
+              setSaving(false);
+              return;
+            }
+          } else if (thirdPartyBackend === 'vertex_gateway') {
+            if (!trimmedBaseUrl) {
+              setError('Vertex 网关后端必须填写 Base URL（用作 ANTHROPIC_VERTEX_BASE_URL）');
+              setSaving(false);
+              return;
+            }
+          } else if (thirdPartyBackend === 'foundry') {
+            if (!trimmedToken && !apiKey.trim()) {
+              setError('Foundry 后端必须提供 API Key 或 Auth Token');
+              setSaving(false);
+              return;
+            }
           }
-          if (!trimmedToken) {
-            setError('新建第三方提供商时必须填写 ANTHROPIC_AUTH_TOKEN');
-            setSaving(false);
-            return;
+          // bedrock / vertex 直连后端字段留给 customEnv
+
+          if (trimmedBaseUrl) createBody.anthropicBaseUrl = trimmedBaseUrl;
+          if (trimmedToken) createBody.anthropicAuthToken = trimmedToken;
+          // foundry 支持把 API Key 单独传
+          if (thirdPartyBackend === 'foundry' && apiKey.trim()) {
+            createBody.anthropicApiKey = apiKey.trim();
           }
-          createBody.anthropicBaseUrl = trimmedBaseUrl;
-          createBody.anthropicAuthToken = trimmedToken;
+
+          // 仅 anthropic_messages 暴露 disableExperimentalBetas
+          if (
+            thirdPartyBackend === 'anthropic_messages' &&
+            disableExperimentalBetas
+          ) {
+            createBody.disableExperimentalBetas = true;
+          }
         } else {
           // 官方模式 — 根据认证方式设置凭据
           if (authTab === 'setup_token') {
@@ -294,14 +397,27 @@ export function ProviderEditor({
         setNotice('提供商已创建。');
       } else {
         // ── 编辑模式 ──
+        const finalBackend: ProviderBackend =
+          providerType === 'official' ? 'anthropic_official' : thirdPartyBackend;
+
         const patchBody: Record<string, unknown> = {
           name: trimmedName,
+          backend: finalBackend,
           customEnv: envResult.customEnv,
           weight,
         };
 
         if (providerType === 'third_party') {
           patchBody.anthropicBaseUrl = baseUrl.trim();
+          // 仅 anthropic_messages 暴露此字段；其他 backend 显式置回默认（undefined）
+          if (thirdPartyBackend === 'anthropic_messages') {
+            patchBody.disableExperimentalBetas = disableExperimentalBetas;
+          } else {
+            patchBody.disableExperimentalBetas = false;
+          }
+        } else {
+          // 切回官方时清掉该标志
+          patchBody.disableExperimentalBetas = false;
         }
         if (model.trim()) {
           patchBody.anthropicModel = model.trim();
@@ -319,6 +435,11 @@ export function ProviderEditor({
             hasSecretsChange = true;
           } else if (authTokenDirty && authToken.trim()) {
             secretsBody.anthropicAuthToken = authToken.trim();
+            hasSecretsChange = true;
+          }
+          // Foundry 支持 API Key
+          if (thirdPartyBackend === 'foundry' && apiKey.trim()) {
+            secretsBody.anthropicApiKey = apiKey.trim();
             hasSecretsChange = true;
           }
         } else {
@@ -595,59 +716,282 @@ export function ProviderEditor({
           {/* ─── 第三方模式 ─── */}
           {providerType === 'third_party' && (
             <div className="space-y-4">
+              {/* 第二级 backend 选择 */}
               <div>
-                <label className="block text-xs text-muted-foreground mb-1">ANTHROPIC_BASE_URL</label>
-                <Input
-                  type="text"
-                  value={baseUrl}
-                  onChange={(e) => setBaseUrl(e.target.value)}
+                <label className="block text-xs text-muted-foreground mb-1">Backend 类型</label>
+                <select
+                  value={thirdPartyBackend}
+                  onChange={(e) => setThirdPartyBackend(e.target.value as ThirdPartyBackend)}
                   disabled={saving}
-                  placeholder="https://your-relay.example.com/v1"
-                />
+                  className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary/30"
+                >
+                  {THIRD_PARTY_BACKEND_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-xs text-muted-foreground mt-1">
+                  {THIRD_PARTY_BACKEND_OPTIONS.find((o) => o.value === thirdPartyBackend)
+                    ?.description}
+                </p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  不确定？大多数 OpenAI/Claude 兼容网关（GLM、Minimax、LiteLLM unified
+                  等）选「Anthropic 兼容网关」并建议勾选兼容模式。
+                </p>
               </div>
 
-              <div>
-                <label className="block text-xs text-muted-foreground mb-1">
-                  ANTHROPIC_AUTH_TOKEN{' '}
-                  {!isCreate && provider?.hasAnthropicAuthToken
-                    ? `(${provider.anthropicAuthTokenMasked})`
-                    : ''}
-                </label>
-                <Input
-                  type="password"
-                  value={authToken}
-                  onChange={(e) => {
-                    setAuthToken(e.target.value);
-                    setAuthTokenDirty(true);
-                    setClearTokenOnSave(false);
-                  }}
-                  disabled={saving || clearTokenOnSave}
-                  placeholder={
-                    isCreate
-                      ? '输入 Token（必填）'
-                      : provider?.hasAnthropicAuthToken
-                        ? '留空不变；输入新值覆盖'
-                        : '输入 Token（可选）'
-                  }
-                />
-                {!isCreate && provider?.hasAnthropicAuthToken && (
-                  <label className="mt-2 inline-flex items-center gap-2 text-xs text-muted-foreground">
+              {/* anthropic_messages：Base URL + Auth Token + 可选兼容模式 */}
+              {thirdPartyBackend === 'anthropic_messages' && (
+                <>
+                  <div>
+                    <label className="block text-xs text-muted-foreground mb-1">
+                      ANTHROPIC_BASE_URL <span className="text-red-500">*</span>
+                    </label>
+                    <Input
+                      type="text"
+                      value={baseUrl}
+                      onChange={(e) => setBaseUrl(e.target.value)}
+                      disabled={saving}
+                      placeholder="https://your-relay.example.com/v1"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs text-muted-foreground mb-1">
+                      ANTHROPIC_AUTH_TOKEN <span className="text-red-500">*</span>{' '}
+                      {!isCreate && provider?.hasAnthropicAuthToken
+                        ? `(${provider.anthropicAuthTokenMasked})`
+                        : ''}
+                    </label>
+                    <Input
+                      type="password"
+                      value={authToken}
+                      onChange={(e) => {
+                        setAuthToken(e.target.value);
+                        setAuthTokenDirty(true);
+                        setClearTokenOnSave(false);
+                      }}
+                      disabled={saving || clearTokenOnSave}
+                      placeholder={
+                        isCreate
+                          ? '输入 Token（必填）'
+                          : provider?.hasAnthropicAuthToken
+                            ? '留空不变；输入新值覆盖'
+                            : '输入 Token（可选）'
+                      }
+                    />
+                    {!isCreate && provider?.hasAnthropicAuthToken && (
+                      <label className="mt-2 inline-flex items-center gap-2 text-xs text-muted-foreground">
+                        <input
+                          type="checkbox"
+                          checked={clearTokenOnSave}
+                          onChange={(e) => {
+                            setClearTokenOnSave(e.target.checked);
+                            if (e.target.checked) {
+                              setAuthToken('');
+                              setAuthTokenDirty(false);
+                            }
+                          }}
+                          disabled={saving}
+                        />
+                        保存时清空当前 Token
+                      </label>
+                    )}
+                  </div>
+
+                  <label className="inline-flex items-start gap-2 text-xs text-muted-foreground">
                     <input
                       type="checkbox"
-                      checked={clearTokenOnSave}
+                      checked={disableExperimentalBetas}
+                      onChange={(e) => setDisableExperimentalBetas(e.target.checked)}
+                      disabled={saving}
+                      className="mt-0.5"
+                    />
+                    <span>
+                      禁用实验 beta（兼容老网关）
+                      <span className="block text-[11px] text-muted-foreground mt-0.5">
+                        注入 <code className="bg-muted px-1 rounded">CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1</code>，
+                        如果你的第三方网关报错 "Unsupported beta header"，请勾选。
+                      </span>
+                    </span>
+                  </label>
+                </>
+              )}
+
+              {/* bedrock：仅 model + customEnv 提示 */}
+              {thirdPartyBackend === 'bedrock' && (
+                <div className="rounded-md border border-amber-200 bg-amber-50/50 dark:bg-amber-950/30 p-3 text-xs text-amber-800 dark:text-amber-300 space-y-1">
+                  <div className="font-medium">AWS 凭据通过自定义环境变量透传</div>
+                  <div>
+                    将以下任一组合填入下方「自定义环境变量」：
+                  </div>
+                  <ul className="list-disc ml-5 space-y-0.5">
+                    <li><code className="bg-muted px-1 rounded">AWS_REGION</code>（必填，例如 us-east-1）</li>
+                    <li><code className="bg-muted px-1 rounded">AWS_PROFILE</code>（如使用 ~/.aws/credentials profile）</li>
+                    <li><code className="bg-muted px-1 rounded">AWS_ACCESS_KEY_ID</code> + <code className="bg-muted px-1 rounded">AWS_SECRET_ACCESS_KEY</code>（如显式凭据）</li>
+                    <li><code className="bg-muted px-1 rounded">AWS_BEARER_TOKEN_BEDROCK</code>（如使用 bearer token 认证）</li>
+                  </ul>
+                  <div>
+                    HappyClaw 会自动注入 <code className="bg-muted px-1 rounded">CLAUDE_CODE_USE_BEDROCK=1</code>。
+                  </div>
+                </div>
+              )}
+
+              {/* bedrock_gateway：Base URL（必填）+ customEnv 提示 */}
+              {thirdPartyBackend === 'bedrock_gateway' && (
+                <>
+                  <div>
+                    <label className="block text-xs text-muted-foreground mb-1">
+                      Base URL <span className="text-red-500">*</span>
+                      <span className="block text-[11px] text-muted-foreground">
+                        用作 ANTHROPIC_BEDROCK_BASE_URL
+                      </span>
+                    </label>
+                    <Input
+                      type="text"
+                      value={baseUrl}
+                      onChange={(e) => setBaseUrl(e.target.value)}
+                      disabled={saving}
+                      placeholder="https://litellm.example.com/bedrock"
+                    />
+                  </div>
+                  <div className="rounded-md border border-amber-200 bg-amber-50/50 dark:bg-amber-950/30 p-3 text-xs text-amber-800 dark:text-amber-300 space-y-1">
+                    <div className="font-medium">网关 Token 通过自定义环境变量透传</div>
+                    <div>
+                      请参考 LiteLLM/one-api 等网关文档，将其要求的认证 env（通常是
+                      <code className="bg-muted px-1 rounded mx-1">ANTHROPIC_AUTH_TOKEN</code>
+                      或 <code className="bg-muted px-1 rounded">AWS_BEARER_TOKEN_BEDROCK</code>）填到下方「自定义环境变量」。
+                    </div>
+                    <div>
+                      HappyClaw 会自动注入
+                      <code className="bg-muted px-1 rounded mx-1">CLAUDE_CODE_USE_BEDROCK=1</code>
+                      和 <code className="bg-muted px-1 rounded">CLAUDE_CODE_SKIP_BEDROCK_AUTH=1</code>。
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {/* vertex：仅 model + customEnv 提示 */}
+              {thirdPartyBackend === 'vertex' && (
+                <div className="rounded-md border border-amber-200 bg-amber-50/50 dark:bg-amber-950/30 p-3 text-xs text-amber-800 dark:text-amber-300 space-y-1">
+                  <div className="font-medium">GCP 凭据通过自定义环境变量透传</div>
+                  <div>请把以下 env 填到下方「自定义环境变量」：</div>
+                  <ul className="list-disc ml-5 space-y-0.5">
+                    <li><code className="bg-muted px-1 rounded">ANTHROPIC_VERTEX_PROJECT_ID</code>（GCP project ID）</li>
+                    <li><code className="bg-muted px-1 rounded">CLOUD_ML_REGION</code>（如 us-east5）</li>
+                    <li><code className="bg-muted px-1 rounded">GOOGLE_APPLICATION_CREDENTIALS</code>（service account JSON 路径）</li>
+                  </ul>
+                  <div>
+                    HappyClaw 会自动注入 <code className="bg-muted px-1 rounded">CLAUDE_CODE_USE_VERTEX=1</code>。
+                  </div>
+                </div>
+              )}
+
+              {/* vertex_gateway：Base URL（必填）+ customEnv 提示 */}
+              {thirdPartyBackend === 'vertex_gateway' && (
+                <>
+                  <div>
+                    <label className="block text-xs text-muted-foreground mb-1">
+                      Base URL <span className="text-red-500">*</span>
+                      <span className="block text-[11px] text-muted-foreground">
+                        用作 ANTHROPIC_VERTEX_BASE_URL
+                      </span>
+                    </label>
+                    <Input
+                      type="text"
+                      value={baseUrl}
+                      onChange={(e) => setBaseUrl(e.target.value)}
+                      disabled={saving}
+                      placeholder="https://litellm.example.com/vertex"
+                    />
+                  </div>
+                  <div className="rounded-md border border-amber-200 bg-amber-50/50 dark:bg-amber-950/30 p-3 text-xs text-amber-800 dark:text-amber-300 space-y-1">
+                    <div className="font-medium">GCP project / region / token 通过自定义环境变量透传</div>
+                    <div>请参考 LiteLLM 等网关文档，把 project_id、region、token 填到下方「自定义环境变量」。</div>
+                    <div>
+                      HappyClaw 会自动注入
+                      <code className="bg-muted px-1 rounded mx-1">CLAUDE_CODE_USE_VERTEX=1</code>
+                      和 <code className="bg-muted px-1 rounded">CLAUDE_CODE_SKIP_VERTEX_AUTH=1</code>。
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {/* foundry：Base URL（可选）+ API Key/Auth Token（必填，二选一） */}
+              {thirdPartyBackend === 'foundry' && (
+                <>
+                  <div>
+                    <label className="block text-xs text-muted-foreground mb-1">
+                      Base URL（可选）
+                      <span className="block text-[11px] text-muted-foreground">
+                        用作 ANTHROPIC_FOUNDRY_BASE_URL
+                      </span>
+                    </label>
+                    <Input
+                      type="text"
+                      value={baseUrl}
+                      onChange={(e) => setBaseUrl(e.target.value)}
+                      disabled={saving}
+                      placeholder="https://your-foundry-resource.cognitiveservices.azure.com"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-muted-foreground mb-1">
+                      <span className="flex items-center gap-1.5">
+                        <Key className="w-3.5 h-3.5" />
+                        API Key <span className="text-red-500">*</span>
+                        <span className="text-[11px] text-muted-foreground">
+                          （或下方 Auth Token 二选一）
+                        </span>
+                        {!isCreate && provider?.hasAnthropicApiKey
+                          ? `(${provider.anthropicApiKeyMasked})`
+                          : ''}
+                      </span>
+                    </label>
+                    <Input
+                      type="password"
+                      value={apiKey}
+                      onChange={(e) => setApiKey(e.target.value)}
+                      disabled={saving}
+                      placeholder={
+                        !isCreate && provider?.hasAnthropicApiKey
+                          ? '输入新值覆盖'
+                          : '输入 Foundry API Key'
+                      }
+                      className="font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-muted-foreground mb-1">
+                      Auth Token（可选，与 API Key 二选一）{' '}
+                      {!isCreate && provider?.hasAnthropicAuthToken
+                        ? `(${provider.anthropicAuthTokenMasked})`
+                        : ''}
+                    </label>
+                    <Input
+                      type="password"
+                      value={authToken}
                       onChange={(e) => {
-                        setClearTokenOnSave(e.target.checked);
-                        if (e.target.checked) {
-                          setAuthToken('');
-                          setAuthTokenDirty(false);
-                        }
+                        setAuthToken(e.target.value);
+                        setAuthTokenDirty(true);
+                        setClearTokenOnSave(false);
                       }}
                       disabled={saving}
+                      placeholder={
+                        !isCreate && provider?.hasAnthropicAuthToken
+                          ? '留空不变；输入新值覆盖'
+                          : '输入 Auth Token'
+                      }
                     />
-                    保存时清空当前 Token
-                  </label>
-                )}
-              </div>
+                  </div>
+                  <div className="rounded-md border border-amber-200 bg-amber-50/50 dark:bg-amber-950/30 p-3 text-xs text-amber-800 dark:text-amber-300">
+                    HappyClaw 会自动注入
+                    <code className="bg-muted px-1 rounded mx-1">CLAUDE_CODE_USE_FOUNDRY=1</code>
+                    并把上方填的 API Key 映射到 ANTHROPIC_FOUNDRY_API_KEY。
+                  </div>
+                </>
+              )}
             </div>
           )}
 
