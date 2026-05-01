@@ -216,6 +216,13 @@ export interface ContainerOutput {
   sdkMessageUuid?: string;
   sourceKind?: Exclude<MessageSourceKind, 'user_command'>;
   finalizationReason?: 'completed' | 'interrupted' | 'error';
+  /**
+   * Optional provider error diagnostic — populated by agent-output-parser when
+   * stderr matches a known provider failure pattern (invalid beta flag /
+   * Bedrock auth / Vertex auth / Foundry auth).
+   * See `src/provider-diagnostics.ts`.
+   */
+  providerDiagnostic?: import('./provider-diagnostics.js').ProviderDiagnostic;
 }
 
 interface VolumeMount {
@@ -925,7 +932,10 @@ export async function runContainerAgent(
       if (result.status === 'success' || result.status === 'closed') {
         providerPool.reportSuccess(selectedProfileId);
       } else if (result.status === 'error' && isApiError(result.error || '')) {
-        providerPool.reportFailure(selectedProfileId);
+        providerPool.reportFailure(selectedProfileId, {
+          errorMessage: result.error,
+          diagnostic: result.providerDiagnostic ?? null,
+        });
       }
     }
 
@@ -1680,7 +1690,10 @@ export async function runHostAgent(
         hostResult.status === 'error' &&
         isApiError(hostResult.error || '')
       ) {
-        providerPool.reportFailure(hostSelectedProfileId);
+        providerPool.reportFailure(hostSelectedProfileId, {
+          errorMessage: hostResult.error,
+          diagnostic: hostResult.providerDiagnostic ?? null,
+        });
       }
     }
 

@@ -35,6 +35,21 @@ export interface UnifiedProviderPublic {
   updatedAt: string;
 }
 
+export type ProviderDiagnosticKind =
+  | 'invalid_beta'
+  | 'unsupported_beta'
+  | 'bedrock_auth'
+  | 'vertex_auth'
+  | 'foundry_auth'
+  | 'unknown';
+
+export interface ProviderDiagnostic {
+  kind: ProviderDiagnosticKind;
+  message: string;
+  hint: string;
+  suggestedAction?: string;
+}
+
 export interface ProviderHealthStatus {
   profileId: string;
   healthy: boolean;
@@ -43,6 +58,10 @@ export interface ProviderHealthStatus {
   lastSuccessAt: number | null;
   unhealthySince: number | null;
   activeSessionCount: number;
+  /** Tail of the most recent failure message (null if never failed). */
+  lastErrorMessage?: string | null;
+  /** Structured diagnostic for the most recent failure (null if no match). */
+  lastDiagnostic?: ProviderDiagnostic | null;
 }
 
 export interface ProviderWithHealth extends UnifiedProviderPublic {

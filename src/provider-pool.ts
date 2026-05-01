@@ -6,6 +6,7 @@
  */
 import { logger } from './logger.js';
 import type { BalancingConfig } from './runtime-config.js';
+import type { ProviderDiagnostic } from './provider-diagnostics.js';
 
 // ─── 类型定义 ──────────────────────────────────────────────
 
@@ -23,6 +24,10 @@ export interface ProviderHealthStatus {
   lastSuccessAt: number | null;
   unhealthySince: number | null;
   activeSessionCount: number;
+  /** Short diagnostic note for the most recent failure (truncated stderr tail). */
+  lastErrorMessage: string | null;
+  /** Structured diagnostic produced by `diagnoseProviderError`, if matched. */
+  lastDiagnostic: ProviderDiagnostic | null;
 }
 
 // ─── 常量 ──────────────────────────────────────────────────
@@ -39,6 +44,8 @@ function makeHealthStatus(profileId: string): ProviderHealthStatus {
     lastSuccessAt: null,
     unhealthySince: null,
     activeSessionCount: 0,
+    lastErrorMessage: null,
+    lastDiagnostic: null,
   };
 }
 
@@ -183,6 +190,10 @@ export class ProviderPool {
     const health = this.getOrCreateHealth(profileId);
     health.consecutiveErrors = 0;
     health.lastSuccessAt = Date.now();
+    // Clear stale failure annotations on recovery so the UI does not keep
+    // showing an outdated diagnostic banner.
+    health.lastErrorMessage = null;
+    health.lastDiagnostic = null;
     if (!health.healthy) {
       health.healthy = true;
       health.unhealthySince = null;
@@ -190,10 +201,23 @@ export class ProviderPool {
     }
   }
 
-  reportFailure(profileId: string): void {
+  reportFailure(
+    profileId: string,
+    info?: {
+      errorMessage?: string;
+      diagnostic?: ProviderDiagnostic | null;
+    },
+  ): void {
     const health = this.getOrCreateHealth(profileId);
     health.consecutiveErrors += 1;
     health.lastErrorAt = Date.now();
+    if (info?.errorMessage) {
+      // Cap to 500 chars so memory does not balloon on chatty stderr.
+      health.lastErrorMessage = info.errorMessage.slice(0, 500);
+    }
+    if (info?.diagnostic !== undefined) {
+      health.lastDiagnostic = info.diagnostic ?? null;
+    }
 
     if (
       health.healthy &&
@@ -206,6 +230,7 @@ export class ProviderPool {
           profileId,
           consecutiveErrors: health.consecutiveErrors,
           threshold: this.unhealthyThreshold,
+          diagnosticKind: health.lastDiagnostic?.kind,
         },
         'Provider marked unhealthy after consecutive failures',
       );

@@ -224,6 +224,20 @@ StreamEvent 类型以 `shared/stream-event.ts` 为单一真相源，构建时通
 
 最终写入 `data/env/{folder}/env` → 只读挂载到容器 `/workspace/env-dir/env`。
 
+**Provider Backend 类型**（V5 schema，`UnifiedProvider.backend`，对应 `src/runtime-config.ts` 的 `buildClaudeEnvLines` 分支）：
+
+| backend | 说明 |
+|---------|------|
+| `anthropic_official` | Anthropic 官方 OAuth / API key，注入 `ANTHROPIC_API_KEY` 或 OAuth credentials |
+| `anthropic_messages` | Anthropic Messages 兼容网关（GLM / Minimax / OpenAI-compatible 网关），仅注入 `ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY` |
+| `bedrock` | 直连 AWS Bedrock，注入 `CLAUDE_CODE_USE_BEDROCK=1`，AWS 凭据走 customEnv 透传 |
+| `bedrock_gateway` | Bedrock 后端的 LiteLLM 等网关，注入 `CLAUDE_CODE_USE_BEDROCK=1` + `CLAUDE_CODE_SKIP_BEDROCK_AUTH=1` + `ANTHROPIC_BEDROCK_BASE_URL` |
+| `vertex` | 直连 Google Vertex AI，注入 `CLAUDE_CODE_USE_VERTEX=1`，GCP 凭据走 customEnv 透传 |
+| `vertex_gateway` | Vertex 后端的网关，注入 `CLAUDE_CODE_USE_VERTEX=1` + `CLAUDE_CODE_SKIP_VERTEX_AUTH=1` + `ANTHROPIC_VERTEX_BASE_URL` + project_id + region |
+| `foundry` | Microsoft Foundry，注入 `CLAUDE_CODE_USE_FOUNDRY=1` + `ANTHROPIC_FOUNDRY_RESOURCE`（或 base URL）+ Foundry API key |
+
+老的 V4 `type='third_party'` 默认迁移为 `anthropic_messages`，行为零变化。`disableExperimentalBetas` 仅在显式勾选时注入 `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`，用于绕开 Anthropic Messages 兼容网关 + Bedrock/Vertex 后端的 beta header 不兼容（issue [#30926](https://github.com/anthropics/claude-code/issues/30926)）。
+
 ### 3.6 WebSocket 协议
 
 **服务端 → 客户端（`WsMessageOut`）**：
@@ -545,10 +559,12 @@ WebSocket：`/ws`（协议详见 §3.6）。
 - **Issue / PR 规范**见下方 §10.1
 - 系统路径不可通过文件 API 操作：`logs/`、`CLAUDE.md`、`.claude/`、`conversations/`
 - StreamEvent 类型以 `shared/stream-event.ts` 为单一真相源，修改后运行 `make sync-types` 同步（`make build` 自动触发，`make typecheck` 校验一致性）
-- Claude SDK / CLI 和容器内置的第三方工具始终使用最新版本：
-  - `@anthropic-ai/claude-agent-sdk` 在 `agent-runner/package.json` 用 `"*"` + 无 lock file + `CACHEBUST` 触发每次 `npm install` 重跑
+- Claude SDK / CLI 版本策略（root vs agent-runner 分裂）：
+  - **root `package.json`**：`@anthropic-ai/claude-agent-sdk` **pin 到精确版本**（当前 `0.2.126`）。root SDK 仅给 `src/sdk-query.ts` 中的辅助查询（标题生成等）使用，pin 求稳，避免 npm latest 漂移导致辅助查询行为不可预期
+  - **`container/agent-runner/package.json`**：保持 `"*"` + 无 lock file + `CACHEBUST` 触发每次 `npm install` 重跑。agent-runner SDK 是主会话执行引擎，跟随 npm latest，享受新能力
+  - **二者行为差异时优先以 agent-runner 为准**；排查 sdkQuery 与主会话表现差异（如「sdkQuery 成功但主会话失败」或反之）时，第一步先比对两边版本：`make print-sdk-versions` 或 `make status` 末尾会打印
   - `feishu-cli` 在 `container/Dockerfile` 通过 `github.com/riba2534/feishu-cli/releases/latest` 的 **302 redirect Location header** 提取 tag 动态下载（不走 `api.github.com` 规避 rate limit），binary 和 skills 共享同一 `$VERSION` 确保一致
-  - 通过 `make update-sdk` 手动触发一次更新
+  - 通过 `make update-sdk` 手动触发一次 agent-runner SDK 更新；root SDK 升级需手动改 `package.json` 的 pin 版本
 - 容器内以 `node` 非 root 用户运行，需注意文件权限
 - **关闭服务时禁止 `lsof -ti:PORT | xargs kill`**，该命令会杀掉所有连接到该端口的进程（包括 OrbStack/Docker 网络代理），导致 Docker daemon 崩溃。正确做法：`lsof -ti:PORT -sTCP:LISTEN | xargs kill`（仅杀监听进程）
 

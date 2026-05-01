@@ -264,6 +264,17 @@ export function ProviderList({
                     </div>
                   )}
 
+                  {/* 诊断 hint（命中规则时展示，引导用户下一步操作） */}
+                  {health?.lastDiagnostic && provider.enabled && (
+                    <div
+                      className="mt-1.5 ml-4 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-1.5 max-w-2xl"
+                      title={health.lastDiagnostic.message}
+                    >
+                      <span className="font-medium">诊断 [{health.lastDiagnostic.kind}]：</span>
+                      {health.lastDiagnostic.hint}
+                    </div>
+                  )}
+
                   {/* 活跃会话（健康正常时） */}
                   {health && provider.enabled && health.healthy && health.activeSessionCount > 0 && (
                     <div className="mt-1 ml-4 text-xs text-teal-600">

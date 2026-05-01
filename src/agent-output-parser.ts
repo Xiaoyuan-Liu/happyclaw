@@ -9,6 +9,11 @@ import type { Readable } from 'stream';
 import { getSystemSettings } from './runtime-config.js';
 import { logger } from './logger.js';
 import type { ContainerOutput } from './container-runner.js';
+import {
+  diagnoseProviderError,
+  diagnosticToLogLine,
+  type ProviderDiagnostic,
+} from './provider-diagnostics.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 export const OUTPUT_START_MARKER = '---HAPPYCLAW_OUTPUT_START---';
@@ -452,6 +457,12 @@ export function handleNonZeroExit(
         error: `${ctx.label} exited with ${exitLabel}: ${stderr.slice(-200)}`,
       };
 
+  // Try to surface a structured provider diagnostic for the UI.
+  // Search both stderr and stdout because some upstream errors land in stdout.
+  const diagnosticCorpus = `${stderr}\n${ctx.stdoutState.stdout}`;
+  const providerDiagnostic: ProviderDiagnostic | undefined =
+    diagnoseProviderError({ errorText: diagnosticCorpus }) ?? undefined;
+
   logger.error(
     {
       group: ctx.groupName,
@@ -461,6 +472,9 @@ export function handleNonZeroExit(
       stderr,
       stdout: ctx.stdoutState.stdout,
       logFile,
+      providerDiagnostic: providerDiagnostic
+        ? diagnosticToLogLine(providerDiagnostic)
+        : undefined,
     },
     `${ctx.label} exited with error`,
   );
@@ -470,6 +484,7 @@ export function handleNonZeroExit(
       status: 'error',
       result: enriched.result,
       error: enriched.error,
+      providerDiagnostic,
     });
   };
 

@@ -1,7 +1,7 @@
 .PHONY: dev dev-backend dev-web build build-backend build-web start \
        typecheck typecheck-backend typecheck-web typecheck-agent-runner \
        format format-check install install-host-tools clean reset-init update-sdk ensure-latest-sdk sync-types \
-       backup restore help _ensure-docker-image logs status stop \
+       backup restore help _ensure-docker-image logs status stop print-sdk-versions \
        _check-sync _build-web-if-stale _build-ar-if-stale _build-backend-if-stale \
        _start-pm2 _start-direct
 
@@ -51,6 +51,7 @@ dev-web: ## 仅启动前端
 build: sync-types ## 编译前后端及 agent-runner
 	$(PKG) run build:all
 	@touch .build-sentinel
+	@$(MAKE) --no-print-directory print-sdk-versions
 
 build-backend: ## 仅编译后端
 	$(PKG) run build
@@ -174,6 +175,9 @@ status: ## 查看服务运行状态
 	@echo ""
 	@echo "=== Docker 容器 ==="
 	@docker ps --filter "name=happyclaw" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || echo "   Docker 未运行或无 HappyClaw 容器"
+	@echo ""
+	@echo "=== SDK 版本 ==="
+	@$(MAKE) --no-print-directory print-sdk-versions
 
 # ─── Quality ─────────────────────────────────────────────────
 
@@ -241,6 +245,13 @@ update-sdk: ## 更新 agent-runner 的 Claude Agent SDK 到最新版本
 	@# npm/bun update 会将 "*" 回写为具体版本，还原它
 	@sed -i '' 's/"@anthropic-ai\/claude-agent-sdk": "[^"]*"/"@anthropic-ai\/claude-agent-sdk": "*"/' container/agent-runner/package.json
 	@echo "SDK updated. Run 'make typecheck' to verify."
+
+print-sdk-versions: ## 打印 root 与 agent-runner 的 Claude Agent SDK 实际版本
+	@ROOT_VERSION=$$(node -p "require('./node_modules/@anthropic-ai/claude-agent-sdk/package.json').version" 2>/dev/null || echo "(missing)"); \
+	ROOT_PIN=$$(node -p "require('./package.json').dependencies['@anthropic-ai/claude-agent-sdk']" 2>/dev/null || echo "(missing)"); \
+	AR_VERSION=$$(node -p "require('./container/agent-runner/node_modules/@anthropic-ai/claude-agent-sdk/package.json').version" 2>/dev/null || echo "(not built)"); \
+	AR_PIN=$$(node -p "require('./container/agent-runner/package.json').dependencies['@anthropic-ai/claude-agent-sdk']" 2>/dev/null || echo "(missing)"); \
+	echo "📦 SDK versions: root=$$ROOT_VERSION (pin=$$ROOT_PIN) agent-runner=$$AR_VERSION (pin=$$AR_PIN)"
 
 ensure-latest-sdk: ## 启动前自动检测并更新 SDK（有新版才更新）
 	@LOCAL=$$(node -p "require('./container/agent-runner/node_modules/@anthropic-ai/claude-agent-sdk/package.json').version" 2>/dev/null || echo "0.0.0"); \
