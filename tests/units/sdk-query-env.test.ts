@@ -58,11 +58,16 @@ afterEach(() => {
   }
 });
 
+interface CapturedCall {
+  optionsEnv: Record<string, string | undefined> | undefined;
+  processEnvAtCall: NodeJS.ProcessEnv;
+}
+
 async function setupSdkQueryWithProvider(opts: {
   providerSetup: (
     runtime: typeof import('../../src/runtime-config.js'),
   ) => void;
-  capture: (env: NodeJS.ProcessEnv) => void;
+  capture: (call: CapturedCall) => void;
 }): Promise<typeof import('../../src/sdk-query.js')> {
   const dataDir = makeTempDataDir();
   vi.resetModules();
@@ -71,12 +76,16 @@ async function setupSdkQueryWithProvider(opts: {
     DATA_DIR: dataDir,
   }));
 
-  // Mock the SDK query function: capture process.env at call time so the test
-  // can verify the env state during the SDK call (between inject + restore).
+  // Mock the SDK query function: capture both the explicit options.env that
+  // sdkQuery passes (which is what the SDK subprocess actually sees) and
+  // process.env at call time (must be untouched by sdkQuery).
   vi.doMock('@anthropic-ai/claude-agent-sdk', () => {
     return {
-      query: () => {
-        opts.capture({ ...process.env });
+      query: (input: { options?: { env?: Record<string, string> } }) => {
+        opts.capture({
+          optionsEnv: input.options?.env,
+          processEnvAtCall: { ...process.env },
+        });
         async function* gen() {
           yield {
             type: 'result' as const,
@@ -95,7 +104,7 @@ async function setupSdkQueryWithProvider(opts: {
   return import('../../src/sdk-query.js');
 }
 
-describe('sdkQuery reserved-key cleanup', () => {
+describe('sdkQuery env isolation via options.env', () => {
   test('switching from anthropic_official to anthropic_messages strips inherited ANTHROPIC_API_KEY', async () => {
     // Simulate the dangerous case: previous run on anthropic_official left
     // ANTHROPIC_API_KEY in process.env. New active provider is
@@ -104,7 +113,7 @@ describe('sdkQuery reserved-key cleanup', () => {
     // leaks through.
     process.env.ANTHROPIC_API_KEY = 'leaked-official-api-key';
 
-    let capturedEnv: NodeJS.ProcessEnv = {};
+    let captured: CapturedCall | null = null;
     const sdk = await setupSdkQueryWithProvider({
       providerSetup: (runtime) => {
         runtime.createProvider({
@@ -116,31 +125,33 @@ describe('sdkQuery reserved-key cleanup', () => {
           anthropicAuthToken: 'gateway-token',
         });
       },
-      capture: (env) => {
-        capturedEnv = env;
+      capture: (call) => {
+        captured = call;
       },
     });
 
     const result = await sdk.sdkQuery('test prompt');
     expect(result).toBe('mock-response');
+    expect(captured).not.toBeNull();
+    const subprocessEnv = captured!.optionsEnv!;
 
-    // During the SDK call, ANTHROPIC_API_KEY must reflect the active provider's
+    // The env handed to the SDK subprocess must reflect the active provider's
     // mapping (gateway-token), NOT the stale leaked-official-api-key.
-    expect(capturedEnv.ANTHROPIC_API_KEY).toBe('gateway-token');
-    expect(capturedEnv.ANTHROPIC_API_KEY).not.toBe('leaked-official-api-key');
-    expect(capturedEnv.ANTHROPIC_BASE_URL).toBe('https://gateway.example.com');
+    expect(subprocessEnv.ANTHROPIC_API_KEY).toBe('gateway-token');
+    expect(subprocessEnv.ANTHROPIC_API_KEY).not.toBe('leaked-official-api-key');
+    expect(subprocessEnv.ANTHROPIC_BASE_URL).toBe('https://gateway.example.com');
   });
 
   test('switching back from bedrock_gateway to anthropic_official strips CLAUDE_CODE_USE_BEDROCK', async () => {
     // Simulate: previous bedrock_gateway run left CLAUDE_CODE_USE_BEDROCK=1
     // and CLAUDE_CODE_SKIP_BEDROCK_AUTH=1 in process.env. New active provider
-    // is anthropic_official; without reserved cleanup, the SDK would still
-    // dispatch to Bedrock.
+    // is anthropic_official; without reserved cleanup, the SDK subprocess
+    // would still dispatch to Bedrock.
     process.env.CLAUDE_CODE_USE_BEDROCK = '1';
     process.env.CLAUDE_CODE_SKIP_BEDROCK_AUTH = '1';
     process.env.ANTHROPIC_BEDROCK_BASE_URL = 'https://stale-bedrock.example.com';
 
-    let capturedEnv: NodeJS.ProcessEnv = {};
+    let captured: CapturedCall | null = null;
     const sdk = await setupSdkQueryWithProvider({
       providerSetup: (runtime) => {
         runtime.createProvider({
@@ -151,24 +162,26 @@ describe('sdkQuery reserved-key cleanup', () => {
           anthropicApiKey: 'sk-ant-real',
         });
       },
-      capture: (env) => {
-        capturedEnv = env;
+      capture: (call) => {
+        captured = call;
       },
     });
 
     await sdk.sdkQuery('test prompt');
+    const subprocessEnv = captured!.optionsEnv!;
 
-    expect(capturedEnv.CLAUDE_CODE_USE_BEDROCK).toBeUndefined();
-    expect(capturedEnv.CLAUDE_CODE_SKIP_BEDROCK_AUTH).toBeUndefined();
-    expect(capturedEnv.ANTHROPIC_BEDROCK_BASE_URL).toBeUndefined();
-    expect(capturedEnv.ANTHROPIC_API_KEY).toBe('sk-ant-real');
+    expect(subprocessEnv.CLAUDE_CODE_USE_BEDROCK).toBeUndefined();
+    expect(subprocessEnv.CLAUDE_CODE_SKIP_BEDROCK_AUTH).toBeUndefined();
+    expect(subprocessEnv.ANTHROPIC_BEDROCK_BASE_URL).toBeUndefined();
+    expect(subprocessEnv.ANTHROPIC_API_KEY).toBe('sk-ant-real');
   });
 
-  test('process.env is fully restored after sdkQuery (including keys that did not exist before)', async () => {
+  test('process.env is never mutated by sdkQuery (no global side effect)', async () => {
     // Pre-state: ANTHROPIC_API_KEY exists with a "host" value, no ANTHROPIC_BASE_URL.
     process.env.ANTHROPIC_API_KEY = 'host-key';
     expect(process.env.ANTHROPIC_BASE_URL).toBeUndefined();
 
+    let captured: CapturedCall | null = null;
     const sdk = await setupSdkQueryWithProvider({
       providerSetup: (runtime) => {
         runtime.createProvider({
@@ -180,26 +193,34 @@ describe('sdkQuery reserved-key cleanup', () => {
           anthropicAuthToken: 'gateway-token',
         });
       },
-      capture: () => {
-        /* not asserting captured env in this test */
+      capture: (call) => {
+        captured = call;
       },
     });
 
     await sdk.sdkQuery('test');
 
-    // After the call, every reserved key must be back to its pre-call state.
+    // process.env at SDK call time is identical to pre-call state — sdkQuery
+    // never touched it. (This is the core advantage over the previous
+    // mutex+save+restore implementation.)
+    expect(captured!.processEnvAtCall.ANTHROPIC_API_KEY).toBe('host-key');
+    expect(captured!.processEnvAtCall.ANTHROPIC_BASE_URL).toBeUndefined();
+
+    // Post-call: process.env still untouched.
     expect(process.env.ANTHROPIC_API_KEY).toBe('host-key');
     expect(process.env.ANTHROPIC_BASE_URL).toBeUndefined();
     expect(process.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
     expect(process.env.CLAUDE_AGENT_SDK_CLIENT_APP).toBeUndefined();
   });
 
-  test('reserved keys that did not exist before sdkQuery are deleted (not left as undefined string) after restore', async () => {
-    // None of the reserved keys are set pre-call.
-    for (const key of ENV_KEYS_TO_TRACK) {
-      expect(process.env[key]).toBeUndefined();
-    }
+  test('subprocess env merges process.env essentials (e.g. PATH, HOME)', async () => {
+    // The SDK subprocess needs PATH/HOME to spawn the Claude Code CLI binary.
+    // sdkQuery copies process.env first, then strips reserved keys, then
+    // overlays generated provider env — so non-reserved keys are preserved.
+    process.env.PATH = process.env.PATH || '/usr/bin';
+    const expectedPath = process.env.PATH;
 
+    let captured: CapturedCall | null = null;
     const sdk = await setupSdkQueryWithProvider({
       providerSetup: (runtime) => {
         runtime.createProvider({
@@ -211,18 +232,53 @@ describe('sdkQuery reserved-key cleanup', () => {
           anthropicAuthToken: 'gateway-token',
         });
       },
-      capture: () => {
-        /* irrelevant */
+      capture: (call) => {
+        captured = call;
       },
     });
 
     await sdk.sdkQuery('test');
+    const subprocessEnv = captured!.optionsEnv!;
 
-    for (const key of ENV_KEYS_TO_TRACK) {
-      // `key in process.env` is the strict check: undefined value still counts
-      // as present if `process.env[k] = undefined` was used. Restore must
-      // actually `delete` so subsequent `key in process.env` is false.
-      expect(key in process.env).toBe(false);
+    expect(subprocessEnv.PATH).toBe(expectedPath);
+  });
+
+  test('concurrent sdkQuery calls do not interfere via shared global state', async () => {
+    // Without the previous mutex, two parallel calls used to risk corrupting
+    // each other through process.env. With options.env each call has its own
+    // env bag, so concurrency is safe by construction.
+    process.env.ANTHROPIC_API_KEY = 'host-key';
+
+    const captured: CapturedCall[] = [];
+    const sdk = await setupSdkQueryWithProvider({
+      providerSetup: (runtime) => {
+        runtime.createProvider({
+          name: 'Gateway',
+          type: 'third_party',
+          backend: 'anthropic_messages',
+          enabled: true,
+          anthropicBaseUrl: 'https://gateway.example.com',
+          anthropicAuthToken: 'gateway-token',
+        });
+      },
+      capture: (call) => {
+        captured.push(call);
+      },
+    });
+
+    await Promise.all([
+      sdk.sdkQuery('a'),
+      sdk.sdkQuery('b'),
+      sdk.sdkQuery('c'),
+    ]);
+
+    expect(captured).toHaveLength(3);
+    for (const call of captured) {
+      // Each call sees its own clean subprocessEnv with the active gateway
+      // mapping; process.env stays at host-key throughout.
+      expect(call.optionsEnv!.ANTHROPIC_API_KEY).toBe('gateway-token');
+      expect(call.processEnvAtCall.ANTHROPIC_API_KEY).toBe('host-key');
     }
+    expect(process.env.ANTHROPIC_API_KEY).toBe('host-key');
   });
 });
