@@ -22,6 +22,7 @@ import {
 import {
   buildContainerEnvLines,
   getClaudeProviderConfig,
+  getClaudeReservedEnvKeys,
   getContainerEnvConfig,
   getEnabledProviders,
   getBalancingConfig,
@@ -1308,6 +1309,17 @@ export async function runHostAgent(
   const hostEnv: Record<string, string> = {
     ...(process.env as Record<string, string>),
   };
+
+  // Strip ALL reserved Claude env keys inherited from process.env before
+  // injecting per-provider env. Without this, switching from one backend to
+  // another leaks stale credentials — e.g. `ANTHROPIC_API_KEY` left over from
+  // an `anthropic_official` run survives a switch to `anthropic_messages`,
+  // and `CLAUDE_CODE_USE_BEDROCK=1` survives a switch back from
+  // `bedrock_gateway`. Reserved cleanup is unconditional; the generated env
+  // below writes back any keys the new provider needs.
+  for (const key of getClaudeReservedEnvKeys()) {
+    delete hostEnv[key];
+  }
 
   // ─── Provider Pool selection (host mode) ───
   const containerOverride = getContainerEnvConfig(group.folder);

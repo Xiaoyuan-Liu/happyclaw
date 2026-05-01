@@ -5,7 +5,11 @@
  */
 
 import { query } from '@anthropic-ai/claude-agent-sdk';
-import { buildClaudeEnvLines, getClaudeProviderConfig } from './runtime-config.js';
+import {
+  buildClaudeEnvLines,
+  getClaudeProviderConfig,
+  getClaudeReservedEnvKeys,
+} from './runtime-config.js';
 import { logger } from './logger.js';
 
 // Mutex: process.env mutation is not re-entrant. Serialize concurrent calls
@@ -34,16 +38,38 @@ export async function sdkQuery(
 
   const timeout = opts?.timeout ?? 60_000;
 
-  // Inject provider credentials into process.env for the SDK
+  // Inject provider credentials into process.env for the SDK.
+  //
+  // Two stages of backup/restore:
+  //   1. Reserved Claude env keys: snapshot every key in
+  //      RESERVED_CLAUDE_ENV_KEYS even if the new generated env doesn't include
+  //      it, then DELETE all of them. This prevents stale credentials from a
+  //      previous backend (e.g. ANTHROPIC_API_KEY left over after switching to
+  //      a Bedrock gateway, or CLAUDE_CODE_USE_BEDROCK=1 left over after
+  //      switching back to anthropic_messages) from leaking into the SDK call.
+  //   2. Generated env keys: layered on top, restored in `finally` after the
+  //      reserved snapshot is restored.
+  const reservedKeys = getClaudeReservedEnvKeys();
+  const reservedSnapshot: Record<string, string | undefined> = {};
+  for (const key of reservedKeys) {
+    reservedSnapshot[key] = process.env[key];
+    delete process.env[key];
+  }
+
   const config = getClaudeProviderConfig();
   const envLines = buildClaudeEnvLines(config);
-  const savedEnv: Record<string, string | undefined> = {};
+  const generatedSnapshot: Record<string, string | undefined> = {};
   for (const line of envLines) {
     const eq = line.indexOf('=');
     if (eq <= 0) continue;
     const key = line.slice(0, eq);
     const value = line.slice(eq + 1);
-    savedEnv[key] = process.env[key];
+    // After the reserved-cleanup pass `process.env[key]` is already cleared
+    // for any reserved key, so the snapshot here only matters for non-reserved
+    // generated keys (which is currently none, but kept for forward-compat).
+    if (!(key in reservedSnapshot)) {
+      generatedSnapshot[key] = process.env[key];
+    }
     process.env[key] = value;
   }
 
@@ -74,12 +100,24 @@ export async function sdkQuery(
 
     return result.trim() || null;
   } catch (err) {
-    logger.warn({ err: (err as Error).message?.slice(0, 200) }, 'sdkQuery failed');
+    logger.warn(
+      { err: (err as Error).message?.slice(0, 200) },
+      'sdkQuery failed',
+    );
     return null;
   } finally {
     clearTimeout(timer);
-    // Restore original env
-    for (const [key, original] of Object.entries(savedEnv)) {
+    // Restore in reverse order: generated keys first (they were applied last),
+    // then reserved snapshot (which contains the real pre-call state, including
+    // explicit `undefined` for keys that didn't exist before).
+    for (const [key, original] of Object.entries(generatedSnapshot)) {
+      if (original === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = original;
+      }
+    }
+    for (const [key, original] of Object.entries(reservedSnapshot)) {
       if (original === undefined) {
         delete process.env[key];
       } else {

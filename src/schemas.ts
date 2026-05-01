@@ -652,48 +652,12 @@ export const UnifiedProviderCreateSchema = z
     weight: z.number().int().min(1).max(100).optional(),
     enabled: z.boolean().optional(),
   })
-  .superRefine((data, ctx) => {
-    if (
-      data.type === 'third_party' &&
-      !data.anthropicBaseUrl?.trim() &&
-      !data.anthropicAuthToken?.trim()
-    ) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['anthropicBaseUrl'],
-        message: '第三方供应商需要提供 Base URL 或 Auth Token',
-      });
-    }
-    // Backend-specific cross-field requirements.
-    if (data.backend === 'bedrock_gateway' && !data.anthropicBaseUrl?.trim()) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['anthropicBaseUrl'],
-        message:
-          'Bedrock 网关后端必须提供 Base URL（用作 ANTHROPIC_BEDROCK_BASE_URL）',
-      });
-    }
-    if (data.backend === 'vertex_gateway' && !data.anthropicBaseUrl?.trim()) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['anthropicBaseUrl'],
-        message:
-          'Vertex 网关后端必须提供 Base URL（用作 ANTHROPIC_VERTEX_BASE_URL）',
-      });
-    }
-    if (
-      data.backend === 'foundry' &&
-      !data.anthropicApiKey?.trim() &&
-      !data.anthropicAuthToken?.trim()
-    ) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['anthropicApiKey'],
-        message:
-          'Foundry 后端必须提供 API Key（anthropicApiKey 或 anthropicAuthToken 之一）',
-      });
-    }
-  })
+  // Note: cross-field final-state validation (e.g. "third-party providers must
+  // have a base URL or auth token") is enforced at runtime by
+  // `validateProviderFinalState()` so that direct `bedrock` / `vertex`
+  // providers — which authenticate via customEnv (AWS profile / GCP ADC) —
+  // can be created without baseUrl/token. The schema layer only normalizes
+  // the optional `backend` field below.
   .transform((data) => ({
     ...data,
     backend:

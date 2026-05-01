@@ -45,6 +45,7 @@ const TELEGRAM_CONFIG_FILE = path.join(
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const RESERVED_CLAUDE_ENV_KEYS = new Set([
   'CLAUDE_CODE_OAUTH_TOKEN',
+  'ANTHROPIC_API_KEY',
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_MODEL',
@@ -62,6 +63,25 @@ const RESERVED_CLAUDE_ENV_KEYS = new Set([
   // Telemetry tag identifying HappyClaw as the SDK client app
   'CLAUDE_AGENT_SDK_CLIENT_APP',
 ]);
+
+/**
+ * Snapshot of the reserved-key set as a frozen array. Exposed so callers
+ * (sdk-query, container-runner) can clean inherited Claude env without
+ * importing the internal Set or duplicating the list.
+ */
+const RESERVED_CLAUDE_ENV_KEYS_ARRAY = Object.freeze(
+  Array.from(RESERVED_CLAUDE_ENV_KEYS),
+);
+
+/**
+ * Returns a frozen array copy of all reserved Claude env keys.
+ * Use this when scrubbing inherited process.env before injecting per-provider
+ * env, so that switching from one backend to another never leaks stale
+ * credentials (e.g. ANTHROPIC_API_KEY left over after switching to a gateway).
+ */
+export function getClaudeReservedEnvKeys(): readonly string[] {
+  return RESERVED_CLAUDE_ENV_KEYS_ARRAY;
+}
 const DANGEROUS_ENV_VARS = new Set([
   // Code execution / preload attacks
   'LD_PRELOAD',
@@ -1580,6 +1600,100 @@ export function saveBalancingConfig(
   return merged;
 }
 
+/**
+ * Per-backend final-state validation. Run on the **merged** provider record
+ * (after applying patches / secrets edits) so partial updates can't leave the
+ * provider in an unusable shape — e.g. clearing the Foundry API key via the
+ * secrets endpoint after creation, which `UnifiedProviderCreateSchema` would
+ * reject up front but the secrets schema can't see.
+ *
+ * `bedrock` / `vertex` are intentionally permissive: cloud auth (AWS profile /
+ * GCP ADC) is wired through the customEnv path, so HappyClaw cannot reliably
+ * validate it from the provider record alone.
+ */
+export function validateProviderFinalState(
+  provider: UnifiedProvider,
+): { valid: true } | { valid: false; field: string; message: string } {
+  const baseUrl = provider.anthropicBaseUrl?.trim() ?? '';
+  const authToken = provider.anthropicAuthToken?.trim() ?? '';
+  const apiKey = provider.anthropicApiKey?.trim() ?? '';
+  const oauthToken = provider.claudeCodeOauthToken?.trim() ?? '';
+  const hasOauthCreds = !!provider.claudeOAuthCredentials;
+
+  switch (provider.backend) {
+    case 'anthropic_official':
+      if (!apiKey && !oauthToken && !hasOauthCreds) {
+        return {
+          valid: false,
+          field: 'anthropicApiKey',
+          message:
+            '官方 Anthropic 后端必须提供 API Key 或 OAuth 凭据（apiKey / claudeCodeOauthToken / claudeOAuthCredentials 之一）',
+        };
+      }
+      return { valid: true };
+
+    case 'anthropic_messages':
+      if (!baseUrl) {
+        return {
+          valid: false,
+          field: 'anthropicBaseUrl',
+          message: '第三方 Anthropic Messages 后端必须提供 Base URL',
+        };
+      }
+      if (!authToken && !apiKey) {
+        return {
+          valid: false,
+          field: 'anthropicAuthToken',
+          message:
+            '第三方 Anthropic Messages 后端必须提供 Auth Token 或 API Key',
+        };
+      }
+      return { valid: true };
+
+    case 'bedrock_gateway':
+      if (!baseUrl) {
+        return {
+          valid: false,
+          field: 'anthropicBaseUrl',
+          message:
+            'Bedrock 网关后端必须提供 Base URL（用作 ANTHROPIC_BEDROCK_BASE_URL）',
+        };
+      }
+      return { valid: true };
+
+    case 'vertex_gateway':
+      if (!baseUrl) {
+        return {
+          valid: false,
+          field: 'anthropicBaseUrl',
+          message:
+            'Vertex 网关后端必须提供 Base URL（用作 ANTHROPIC_VERTEX_BASE_URL）',
+        };
+      }
+      return { valid: true };
+
+    case 'foundry':
+      if (!apiKey && !authToken) {
+        return {
+          valid: false,
+          field: 'anthropicApiKey',
+          message:
+            'Foundry 后端必须提供 API Key（anthropicApiKey 或 anthropicAuthToken 之一）',
+        };
+      }
+      return { valid: true };
+
+    case 'bedrock':
+    case 'vertex':
+      // Direct cloud backends authenticate via customEnv (AWS profile / GCP ADC);
+      // HappyClaw does not enforce baseUrl/token here.
+      return { valid: true };
+
+    default:
+      return { valid: true };
+  }
+}
+
 export function createProvider(input: {
   name: string;
   type: 'official' | 'third_party';
@@ -1639,6 +1753,11 @@ export function createProvider(input: {
     updatedAt: now,
   };
 
+  const validation = validateProviderFinalState(provider);
+  if (!validation.valid) {
+    throw new Error(validation.message);
+  }
+
   state.providers.push(provider);
   writeStoredStateV5(state.providers, state.balancing);
   return provider;
@@ -1693,6 +1812,11 @@ export function updateProvider(
       : {}),
     updatedAt: new Date().toISOString(),
   };
+
+  const validation = validateProviderFinalState(updated);
+  if (!validation.valid) {
+    throw new Error(validation.message);
+  }
 
   state.providers[idx] = updated;
   writeStoredStateV5(state.providers, state.balancing);
@@ -1754,6 +1878,11 @@ export function updateProviderSecrets(
     updated.claudeCodeOauthToken = '';
   } else if (secrets.clearClaudeOAuthCredentials) {
     updated.claudeOAuthCredentials = null;
+  }
+
+  const validation = validateProviderFinalState(updated);
+  if (!validation.valid) {
+    throw new Error(validation.message);
   }
 
   state.providers[idx] = updated;
@@ -2762,12 +2891,19 @@ export function buildClaudeEnvLines(
     }
   } else if (backend === 'bedrock_gateway') {
     // LLM-gateway in front of Bedrock. Skip AWS auth, point SDK at gateway URL.
-    // Gateway's own auth token (if any) must be injected via customEnv.
+    // Gateway's own auth token (when configured via the provider form / secrets
+    // endpoint) is injected as ANTHROPIC_AUTH_TOKEN so the SDK forwards it on
+    // each request; additional gateway-specific env can still come via customEnv.
     lines.push('CLAUDE_CODE_USE_BEDROCK=1');
     lines.push('CLAUDE_CODE_SKIP_BEDROCK_AUTH=1');
     if (config.anthropicBaseUrl) {
       lines.push(
         `ANTHROPIC_BEDROCK_BASE_URL=${sanitizeEnvValue(config.anthropicBaseUrl)}`,
+      );
+    }
+    if (config.anthropicAuthToken) {
+      lines.push(
+        `ANTHROPIC_AUTH_TOKEN=${sanitizeEnvValue(config.anthropicAuthToken)}`,
       );
     }
     if (config.anthropicModel) {
@@ -2782,12 +2918,18 @@ export function buildClaudeEnvLines(
     }
   } else if (backend === 'vertex_gateway') {
     // LLM-gateway in front of Vertex. Skip GCP auth, point SDK at gateway.
-    // Gateway token + project/region must come from customEnv.
+    // Gateway token (when configured) is injected as ANTHROPIC_AUTH_TOKEN; project/region
+    // are still expected via customEnv (ANTHROPIC_VERTEX_PROJECT_ID etc.).
     lines.push('CLAUDE_CODE_USE_VERTEX=1');
     lines.push('CLAUDE_CODE_SKIP_VERTEX_AUTH=1');
     if (config.anthropicBaseUrl) {
       lines.push(
         `ANTHROPIC_VERTEX_BASE_URL=${sanitizeEnvValue(config.anthropicBaseUrl)}`,
+      );
+    }
+    if (config.anthropicAuthToken) {
+      lines.push(
+        `ANTHROPIC_AUTH_TOKEN=${sanitizeEnvValue(config.anthropicAuthToken)}`,
       );
     }
     if (config.anthropicModel) {
@@ -3244,6 +3386,16 @@ export function buildContainerEnvLines(
         logger.warn(
           { key },
           'Blocked dangerous env variable in buildContainerEnvLines',
+        );
+        continue;
+      }
+      // Block reserved Claude env keys — these are owned by buildClaudeEnvLines
+      // and must not be shadowed by container-level overrides (otherwise users
+      // could e.g. flip CLAUDE_CODE_USE_BEDROCK=0 and bypass backend dispatch).
+      if (RESERVED_CLAUDE_ENV_KEYS.has(key)) {
+        logger.warn(
+          { key },
+          'Blocked reserved Claude env key in buildContainerEnvLines',
         );
         continue;
       }

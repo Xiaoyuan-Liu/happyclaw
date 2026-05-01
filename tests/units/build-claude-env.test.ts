@@ -264,6 +264,45 @@ describe('buildClaudeEnvLines', () => {
     ).toBe(1);
   });
 
+  test('bedrock_gateway backend injects ANTHROPIC_AUTH_TOKEN when anthropicAuthToken is configured', async () => {
+    const runtime = await importRuntimeConfig();
+
+    const lines = runtime.buildClaudeEnvLines(
+      providerConfig({
+        backend: 'bedrock_gateway',
+        anthropicBaseUrl: 'https://bedrock.gateway.example.com',
+        anthropicAuthToken: 'gateway-bedrock-token',
+        anthropicModel: 'anthropic.claude-sonnet-4-5-v1:0',
+      }),
+      {},
+    );
+
+    expect(lines).toContain('CLAUDE_CODE_USE_BEDROCK=1');
+    expect(lines).toContain('CLAUDE_CODE_SKIP_BEDROCK_AUTH=1');
+    expect(lines).toContain(
+      'ANTHROPIC_BEDROCK_BASE_URL=https://bedrock.gateway.example.com',
+    );
+    expect(lines).toContain('ANTHROPIC_AUTH_TOKEN=gateway-bedrock-token');
+    // No generic ANTHROPIC_BASE_URL leakage.
+    expect(lines.some((l) => l.startsWith('ANTHROPIC_BASE_URL='))).toBe(false);
+  });
+
+  test('bedrock_gateway backend without auth token does NOT emit ANTHROPIC_AUTH_TOKEN', async () => {
+    const runtime = await importRuntimeConfig();
+
+    const lines = runtime.buildClaudeEnvLines(
+      providerConfig({
+        backend: 'bedrock_gateway',
+        anthropicBaseUrl: 'https://bedrock.gateway.example.com',
+      }),
+      {},
+    );
+
+    expect(lines.some((l) => l.startsWith('ANTHROPIC_AUTH_TOKEN='))).toBe(
+      false,
+    );
+  });
+
   test('vertex backend emits CLAUDE_CODE_USE_VERTEX without base URL and forwards GCP env', async () => {
     const runtime = await importRuntimeConfig();
 
@@ -323,6 +362,44 @@ describe('buildClaudeEnvLines', () => {
     ).toBe(1);
   });
 
+  test('vertex_gateway backend injects ANTHROPIC_AUTH_TOKEN when anthropicAuthToken is configured', async () => {
+    const runtime = await importRuntimeConfig();
+
+    const lines = runtime.buildClaudeEnvLines(
+      providerConfig({
+        backend: 'vertex_gateway',
+        anthropicBaseUrl: 'https://vertex.gateway.example.com',
+        anthropicAuthToken: 'gateway-vertex-token',
+        anthropicModel: 'claude-sonnet-4-5@20250219',
+      }),
+      {},
+    );
+
+    expect(lines).toContain('CLAUDE_CODE_USE_VERTEX=1');
+    expect(lines).toContain('CLAUDE_CODE_SKIP_VERTEX_AUTH=1');
+    expect(lines).toContain(
+      'ANTHROPIC_VERTEX_BASE_URL=https://vertex.gateway.example.com',
+    );
+    expect(lines).toContain('ANTHROPIC_AUTH_TOKEN=gateway-vertex-token');
+    expect(lines.some((l) => l.startsWith('ANTHROPIC_BASE_URL='))).toBe(false);
+  });
+
+  test('vertex_gateway backend without auth token does NOT emit ANTHROPIC_AUTH_TOKEN', async () => {
+    const runtime = await importRuntimeConfig();
+
+    const lines = runtime.buildClaudeEnvLines(
+      providerConfig({
+        backend: 'vertex_gateway',
+        anthropicBaseUrl: 'https://vertex.gateway.example.com',
+      }),
+      {},
+    );
+
+    expect(lines.some((l) => l.startsWith('ANTHROPIC_AUTH_TOKEN='))).toBe(
+      false,
+    );
+  });
+
   test('foundry backend maps anthropicApiKey to ANTHROPIC_FOUNDRY_API_KEY and base URL', async () => {
     const runtime = await importRuntimeConfig();
 
@@ -368,6 +445,36 @@ describe('buildClaudeEnvLines', () => {
     );
   });
 
+  test('ANTHROPIC_API_KEY is reserved and cannot be overridden via profile customEnv', async () => {
+    const runtime = await importRuntimeConfig();
+
+    const lines = runtime.buildClaudeEnvLines(
+      providerConfig({
+        backend: 'anthropic_messages',
+        anthropicBaseUrl: 'https://gateway.example.com',
+        anthropicAuthToken: 'real-token',
+      }),
+      {
+        ANTHROPIC_API_KEY: 'leaked-key',
+      },
+    );
+
+    expect(lines).not.toContain('ANTHROPIC_API_KEY=leaked-key');
+    // Backend-generated mapping still wins.
+    expect(lines).toContain('ANTHROPIC_API_KEY=real-token');
+  });
+
+  test('getClaudeReservedEnvKeys returns ANTHROPIC_API_KEY among the reserved keys', async () => {
+    const runtime = await importRuntimeConfig();
+
+    const keys = runtime.getClaudeReservedEnvKeys();
+    expect(Array.isArray(keys)).toBe(true);
+    expect(keys).toContain('ANTHROPIC_API_KEY');
+    expect(keys).toContain('ANTHROPIC_AUTH_TOKEN');
+    expect(keys).toContain('CLAUDE_CODE_USE_BEDROCK');
+    expect(keys).toContain('CLAUDE_AGENT_SDK_CLIENT_APP');
+  });
+
   test('reserved backend env keys cannot be overridden via customEnv', async () => {
     const runtime = await importRuntimeConfig();
 
@@ -397,6 +504,54 @@ describe('buildClaudeEnvLines', () => {
     expect(
       lines.filter((l) => l === 'CLAUDE_AGENT_SDK_CLIENT_APP=happyclaw').length,
     ).toBe(1);
+  });
+});
+
+describe('buildContainerEnvLines reserved-key filtering', () => {
+  test('container-level customEnv cannot shadow reserved Claude env keys', async () => {
+    const runtime = await importRuntimeConfig();
+
+    const lines = runtime.buildContainerEnvLines(
+      providerConfig({
+        backend: 'bedrock_gateway',
+        anthropicBaseUrl: 'https://bedrock.gateway.example.com',
+        anthropicAuthToken: 'real-gateway-token',
+      }),
+      {
+        anthropicBaseUrl: '',
+        anthropicAuthToken: '',
+        anthropicApiKey: '',
+        claudeCodeOauthToken: '',
+        claudeOAuthCredentials: null,
+        anthropicModel: '',
+        customEnv: {
+          // All reserved — must be silently dropped from override.customEnv.
+          ANTHROPIC_API_KEY: 'attacker-api-key',
+          ANTHROPIC_AUTH_TOKEN: 'attacker-token',
+          CLAUDE_CODE_USE_BEDROCK: '0',
+          CLAUDE_CODE_SKIP_BEDROCK_AUTH: '0',
+          ANTHROPIC_BEDROCK_BASE_URL: 'https://hijack.example.com',
+          // Non-reserved — should pass through.
+          AWS_REGION: 'us-east-1',
+        },
+      },
+    );
+
+    expect(lines).toContain('CLAUDE_CODE_USE_BEDROCK=1');
+    expect(lines).toContain('CLAUDE_CODE_SKIP_BEDROCK_AUTH=1');
+    expect(lines).toContain(
+      'ANTHROPIC_BEDROCK_BASE_URL=https://bedrock.gateway.example.com',
+    );
+    expect(lines).toContain('ANTHROPIC_AUTH_TOKEN=real-gateway-token');
+    expect(lines).toContain('AWS_REGION=us-east-1');
+    // Reserved overrides dropped.
+    expect(lines).not.toContain('ANTHROPIC_API_KEY=attacker-api-key');
+    expect(lines).not.toContain('ANTHROPIC_AUTH_TOKEN=attacker-token');
+    expect(lines).not.toContain('CLAUDE_CODE_USE_BEDROCK=0');
+    expect(lines).not.toContain('CLAUDE_CODE_SKIP_BEDROCK_AUTH=0');
+    expect(lines).not.toContain(
+      'ANTHROPIC_BEDROCK_BASE_URL=https://hijack.example.com',
+    );
   });
 });
 
