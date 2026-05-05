@@ -360,8 +360,30 @@ export async function hashDirectoryContents(rootDir: string): Promise<string> {
     // is fed to hash.update() in order, so the resulting digest is
     // byte-for-byte equivalent (verified by the compat regression test).
     await new Promise<void>((resolve, reject) => {
-      const stream = fs.createReadStream(e.abs);
+      // Explicit highWaterMark + no encoding => chunks are always Buffer (raw
+      // bytes), matching the legacy fs.readFileSync(buffer) path byte-for-byte.
+      // If encoding were left to default and a future caller mutated the
+      // readable's encoding, hash.update(string) would re-encode through
+      // utf-8, breaking binary hashes (codex review hardening).
+      const stream = fs.createReadStream(e.abs, { highWaterMark: 64 * 1024 });
       stream.on('data', (chunk: Buffer | string) => {
+        // Runtime-narrowed: with no encoding set on the stream, Node always
+        // emits Buffer chunks. The Buffer | string parameter type is forced
+        // by @types/node's ReadStream 'data' event signature; we re-assert
+        // Buffer here so hash.update() takes the raw byte path (no utf-8
+        // re-encoding). If a future caller flips the encoding, route the
+        // failure through `stream.destroy(err)` so the 'error' listener
+        // rejects the outer Promise — throwing from a 'data' listener
+        // bypasses EventEmitter's error path and surfaces as a process-
+        // level uncaughtException instead of a recoverable scan failure.
+        if (typeof chunk === 'string') {
+          stream.destroy(
+            new Error(
+              'plugin-importer hash stream got string chunk; expected Buffer',
+            ),
+          );
+          return;
+        }
         hash.update(chunk);
       });
       stream.on('end', () => resolve());

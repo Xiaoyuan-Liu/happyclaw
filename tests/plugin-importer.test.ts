@@ -161,6 +161,11 @@ describe('hashDirectoryContents', () => {
   });
 
   test('hashes large files through the stream path', async () => {
+    // 8MB triggers the multi-chunk read path: with the stream's
+    // highWaterMark = 64KB, this file produces 128 chunks, exercising
+    // the per-chunk hash.update loop without slowing CI on smaller
+    // boxes. Production plugins with much larger embedded resources
+    // hit the same code path with more iterations.
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hd-stream-'));
     try {
       fs.writeFileSync(path.join(dir, 'big.bin'), Buffer.alloc(8 * 1024 * 1024, 0xcd));

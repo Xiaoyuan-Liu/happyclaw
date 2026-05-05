@@ -2,11 +2,12 @@
 
 ## `yaml` parser trust boundary
 
-`yaml` (npm package) is used in `src/plugin-command-index.ts` to parse
+`yaml` (npm package) is used in `src/plugin-command-index.ts:39` to parse
 plugin command frontmatter. This is a **trusted parser path**:
 
 - Frontmatter content originates from plugin trees in the shared catalog
-  (`data/plugins/catalog/marketplaces/{mp}/plugins/{plugin}/versions/...`)
+  (catalog target dir: `data/plugins/catalog/marketplaces/{mp}/plugins/{plugin}/versions/...`;
+   scan source dir is `getEffectiveExternalDir() + /plugins/marketplaces` per below)
 - The catalog is populated by the backend's `scanHostMarketplaces()`
   (`src/plugin-importer.ts`), which is invoked from three places:
   - server startup (5s after boot, when `pluginAutoScan` is true)
