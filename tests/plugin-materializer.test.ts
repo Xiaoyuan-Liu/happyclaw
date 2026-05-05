@@ -132,7 +132,7 @@ describe('materializeUserRuntime', () => {
     expect(r.warnings).toEqual([]);
   });
 
-  test('builds runtime tree from catalog snapshot via hard links', () => {
+  test('builds runtime tree from catalog snapshot with isolated inodes', () => {
     seedCatalogSnapshot({
       marketplace: 'mp1',
       plugin: 'p1',
@@ -160,12 +160,27 @@ describe('materializeUserRuntime', () => {
     expect(fs.existsSync(path.join(rtDir, '.claude-plugin', 'plugin.json'))).toBe(true);
     expect(fs.readFileSync(path.join(rtDir, 'commands', 'hello.md'), 'utf-8')).toBe('# hi');
 
-    // Confirm hard-link semantics — same inode means same FS, no extra copy.
-    const srcInode = fs.statSync(
+    // Critical safety contract: independent (dev, ino) tuple from catalog.
+    // Hard-links would share the inode and let host-mode bypass-permissions
+    // writes through runtime corrupt the immutable catalog snapshot.
+    const sStat = fs.statSync(
       path.join(getCatalogSnapshotDir('mp1', 'p1', 'sha256-aaa'), 'commands', 'hello.md'),
-    ).ino;
-    const dstInode = fs.statSync(path.join(rtDir, 'commands', 'hello.md')).ino;
-    expect(dstInode).toBe(srcInode);
+    );
+    const dStat = fs.statSync(path.join(rtDir, 'commands', 'hello.md'));
+    expect([dStat.dev, dStat.ino]).not.toEqual([sStat.dev, sStat.ino]);
+
+    // Marker is at sibling path (snapshot root), NOT inside plugin root.
+    expect(
+      fs.existsSync(path.join(rtDir, '@happyclaw-runtime-markers')),
+    ).toBe(false);
+    const markerPath = path.join(
+      getUserSnapshotsDir(USER), 'sha256-aaa', '@happyclaw-runtime-markers', 'mp1', 'p1.json',
+    );
+    expect(fs.existsSync(markerPath)).toBe(true);
+    const marker = JSON.parse(fs.readFileSync(markerPath, 'utf-8'));
+    expect(marker.isolatedInodes).toBe(true);
+    expect(marker.copyMode).toBe('copyfile_ficlone');
+    expect(marker.materializerVersion).toBe(2);
   });
 
   test('idempotent — re-running with same config reuses existing tree', () => {
@@ -221,14 +236,13 @@ describe('materializeUserRuntime', () => {
     expect(r.warnings.some((w) => w.includes('Catalog snapshot missing'))).toBe(true);
   });
 
-  test('cross-fs fallback: cpSync used when hard-link fails', async () => {
-    // Stub fs.linkSync to raise EXDEV the first time it's called per build,
-    // forcing the cpSync fallback. Keep the original around so cleanup still works.
+  test('legacy hard-link runtime is migrated with rename + backup rollback', () => {
+    if (process.platform === 'win32') return; // hardlink test flaky on Windows
     seedCatalogSnapshot({
       marketplace: 'mp1',
       plugin: 'p1',
       snapshot: 'sha256-aaa',
-      files: { 'commands/hi.md': 'hello' },
+      files: { 'commands/hello.md': '# original' },
     });
     writeUserPluginsV2(USER, {
       schemaVersion: 1,
@@ -243,27 +257,145 @@ describe('materializeUserRuntime', () => {
       },
     });
 
-    const linkSpy = vi.spyOn(fs, 'linkSync').mockImplementationOnce(() => {
-      const e = new Error('cross-device') as NodeJS.ErrnoException;
-      e.code = 'EXDEV';
-      throw e;
-    });
+    // Fabricate a legacy hard-link runtime tree (no marker).
+    const rtDir = getUserPluginRuntimeDir(USER, 'sha256-aaa', 'mp1', 'p1');
+    const catalogDir = getCatalogSnapshotDir('mp1', 'p1', 'sha256-aaa');
+    fs.mkdirSync(path.join(rtDir, '.claude-plugin'), { recursive: true });
+    fs.mkdirSync(path.join(rtDir, 'commands'), { recursive: true });
+    fs.linkSync(
+      path.join(catalogDir, '.claude-plugin', 'plugin.json'),
+      path.join(rtDir, '.claude-plugin', 'plugin.json'),
+    );
+    fs.linkSync(
+      path.join(catalogDir, 'commands', 'hello.md'),
+      path.join(rtDir, 'commands', 'hello.md'),
+    );
 
+    // Confirm bad starting state (shared inode).
+    const c0 = fs.statSync(path.join(catalogDir, 'commands', 'hello.md'));
+    const r0 = fs.statSync(path.join(rtDir, 'commands', 'hello.md'));
+    expect([r0.dev, r0.ino]).toEqual([c0.dev, c0.ino]);
+
+    // Trigger migration.
     const r = materializeUserRuntime(USER);
     expect(r.built).toBe(1);
-    expect(r.warnings.some((w) => w.includes('Cross-device fallback'))).toBe(true);
+    expect(r.reused).toBe(0);
+
+    // Inode now isolated.
+    const c1 = fs.statSync(path.join(catalogDir, 'commands', 'hello.md'));
+    const r1 = fs.statSync(path.join(rtDir, 'commands', 'hello.md'));
+    expect([r1.dev, r1.ino]).not.toEqual([c1.dev, c1.ino]);
+
+    // Marker present at sibling path.
+    const markerPath = path.join(
+      getUserSnapshotsDir(USER), 'sha256-aaa', '@happyclaw-runtime-markers', 'mp1', 'p1.json',
+    );
+    expect(fs.existsSync(markerPath)).toBe(true);
+
+    // No legacy backup left around.
+    const parent = path.dirname(rtDir);
+    const leftovers = fs.readdirSync(parent).filter((n) => n.includes('.legacy-bak@'));
+    expect(leftovers).toEqual([]);
+
+    // Idempotent: next materialize is a no-op.
+    const r2 = materializeUserRuntime(USER);
+    expect(r2.reused).toBe(1);
+    expect(r2.built).toBe(0);
+
+    // P1 closed: writing through runtime no longer mutates catalog.
+    fs.writeFileSync(path.join(rtDir, 'commands', 'hello.md'), '# tampered');
+    expect(
+      fs.readFileSync(path.join(catalogDir, 'commands', 'hello.md'), 'utf-8'),
+    ).toBe('# original');
+  });
+
+  test('writing through runtime path does not corrupt catalog snapshot', () => {
+    seedCatalogSnapshot({
+      marketplace: 'mp1', plugin: 'p1', snapshot: 'sha256-aaa',
+      files: { 'commands/hello.md': '# original' },
+    });
+    writeUserPluginsV2(USER, {
+      schemaVersion: 1,
+      enabled: {
+        'p1@mp1': {
+          enabled: true,
+          marketplace: 'mp1',
+          plugin: 'p1',
+          snapshot: 'sha256-aaa',
+          enabledAt: '2026-04-26T00:00:00.000Z',
+        },
+      },
+    });
+    materializeUserRuntime(USER);
+
+    const rtFile = path.join(
+      getUserPluginRuntimeDir(USER, 'sha256-aaa', 'mp1', 'p1'),
+      'commands', 'hello.md',
+    );
+    fs.writeFileSync(rtFile, '# tampered by agent');
+
+    const catalogFile = path.join(
+      getCatalogSnapshotDir('mp1', 'p1', 'sha256-aaa'), 'commands', 'hello.md',
+    );
+    expect(fs.readFileSync(catalogFile, 'utf-8')).toBe('# original');
+  });
+
+  test('symlinks in catalog snapshot are skipped during materialize', () => {
+    if (process.platform === 'win32') return;
+    seedCatalogSnapshot({
+      marketplace: 'mp1', plugin: 'p1', snapshot: 'sha256-aaa',
+      files: { 'commands/real.md': '# real' },
+    });
+    const catalogDir = getCatalogSnapshotDir('mp1', 'p1', 'sha256-aaa');
+    fs.symlinkSync('real.md', path.join(catalogDir, 'commands', 'evil.md'));
+
+    writeUserPluginsV2(USER, {
+      schemaVersion: 1,
+      enabled: {
+        'p1@mp1': {
+          enabled: true,
+          marketplace: 'mp1',
+          plugin: 'p1',
+          snapshot: 'sha256-aaa',
+          enabledAt: '2026-04-26T00:00:00.000Z',
+        },
+      },
+    });
+    materializeUserRuntime(USER);
 
     const rtDir = getUserPluginRuntimeDir(USER, 'sha256-aaa', 'mp1', 'p1');
-    // Bytes copied over → file content correct
-    expect(fs.readFileSync(path.join(rtDir, 'commands', 'hi.md'), 'utf-8')).toBe('hello');
-    // Inodes differ when cpSync was used (separate file allocation)
-    const srcInode = fs.statSync(
-      path.join(getCatalogSnapshotDir('mp1', 'p1', 'sha256-aaa'), 'commands', 'hi.md'),
-    ).ino;
-    const dstInode = fs.statSync(path.join(rtDir, 'commands', 'hi.md')).ino;
-    expect(dstInode).not.toBe(srcInode);
+    expect(fs.existsSync(path.join(rtDir, 'commands', 'real.md'))).toBe(true);
+    expect(fs.existsSync(path.join(rtDir, 'commands', 'evil.md'))).toBe(false);
+  });
 
-    linkSpy.mockRestore();
+  test('corrupt marker is treated as missing and triggers re-materialize', () => {
+    seedCatalogSnapshot({ marketplace: 'mp1', plugin: 'p1', snapshot: 'sha256-aaa' });
+    writeUserPluginsV2(USER, {
+      schemaVersion: 1,
+      enabled: {
+        'p1@mp1': {
+          enabled: true,
+          marketplace: 'mp1',
+          plugin: 'p1',
+          snapshot: 'sha256-aaa',
+          enabledAt: '2026-04-26T00:00:00.000Z',
+        },
+      },
+    });
+
+    const r1 = materializeUserRuntime(USER);
+    expect(r1.built).toBe(1);
+
+    // Corrupt the marker.
+    const markerPath = path.join(
+      getUserSnapshotsDir(USER), 'sha256-aaa', '@happyclaw-runtime-markers', 'mp1', 'p1.json',
+    );
+    fs.writeFileSync(markerPath, '{"materializerVersion":999}', 'utf-8');
+
+    // Next materialize should rebuild (treats corrupt marker as missing).
+    const r2 = materializeUserRuntime(USER);
+    expect(r2.built).toBe(1);
+    expect(r2.reused).toBe(0);
   });
 
   test('partial leftover dir without manifest is wiped before rebuild', () => {

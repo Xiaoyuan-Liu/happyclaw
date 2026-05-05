@@ -12,10 +12,30 @@
  *
  * Materialize strategy per plugin:
  *   1. target = runtime/{userId}/snapshots/{snapshotId}/{mp}/{plugin}
- *   2. if target exists with .claude-plugin/plugin.json → skip
- *   3. else hard-link the catalog snapshot tree (same fs, zero-copy)
- *      cross-fs fallback (EXDEV / EPERM on hard-link) → fs.cpSync(recursive)
- *      both write to a `.tmp-` sibling first, then rename(2) into place
+ *      marker = runtime/{userId}/snapshots/{snapshotId}/@happyclaw-runtime-markers/{mp}/{plugin}.json
+ *   2. if target has plugin.json AND marker exists/validates → skip (already
+ *      isolated-inode)
+ *   3. else copyTreeIsolated catalog → tmp:
+ *        - per-file fs.copyFileSync(..., COPYFILE_FICLONE) — kernel reflinks
+ *          on APFS / btrfs / xfs (initial near-zero copy; COW allocates fresh
+ *          blocks on write); plain byte copy elsewhere
+ *        - skip symlinks (defensive; importer also skips)
+ *      Then place tmp via:
+ *        - new install         → rename(tmp → target)
+ *        - partial leftover    → rmSync(target); rename(tmp → target)
+ *        - legacy hard-link    → rename(target → backup); rename(tmp → target);
+ *                                rmSync(backup). Failure rolls back via
+ *                                rename(backup → target). Avoids the rmSync
+ *                                window that would yank plugin files out from
+ *                                under a live host agent (codex review).
+ *      Finally write the marker at the snapshot-level sibling path so the
+ *      next materialize can prove this tree is isolated-inode without
+ *      polluting the plugin root visible to the SDK loader.
+ *
+ * The independent-inode property is load-bearing: host-mode agents run with
+ * bypassPermissions and the SDK hands them runtime absolute paths; any
+ * plugin/hook/script write through that path must NOT mutate the shared
+ * immutable catalog snapshot. Hard-links broke that contract (codex P1).
  *
  * Symlinks are NEVER used — they would expose the catalog's host path in
  * any logs / inside containers, defeating the read-only mount boundary.
@@ -35,6 +55,32 @@ import {
   type UserPluginsV2,
 } from './plugin-utils.js';
 
+/**
+ * Filename prefix for per-plugin runtime markers. Placed at snapshot-root
+ * level (NOT inside plugin root) so:
+ *   1. SDK plugin loader reading plugin root never sees this file
+ *   2. plugin contents can't accidentally or maliciously contain a same-named
+ *      file that would impersonate the marker and skip the migration check
+ *
+ * `@` is rejected by NAME_SEGMENT_RE (/^[\w.-]+$/), so this directory name
+ * can never collide with a marketplace / plugin / snapshot segment.
+ */
+const MARKER_DIRNAME = '@happyclaw-runtime-markers';
+
+/**
+ * Bumped only on a *semantic* change to the materialize strategy (e.g. swap
+ * out the copy primitive). Don't bump for cosmetic refactors — the bump
+ * triggers re-materialize for every existing user.
+ */
+const RUNTIME_MARKER_VERSION = 2;
+
+interface RuntimeMarker {
+  materializerVersion: number;
+  copyMode: 'copyfile_ficlone';
+  isolatedInodes: true;
+  builtAt: string;
+}
+
 export interface MaterializeReport {
   /** Snapshots already on disk and validated; no work done. */
   reused: number;
@@ -42,7 +88,7 @@ export interface MaterializeReport {
   built: number;
   /** Snapshot dirs removed by cleanupOrphanRuntime. */
   cleaned: number;
-  /** Non-fatal issues (missing catalog snapshot, copy fallback, etc). */
+  /** Non-fatal issues (missing catalog snapshot, materialize failures, etc). */
   warnings: string[];
 }
 
@@ -117,9 +163,12 @@ export function getUserPluginRuntimeDir(
  * (both have visibility into which snapshots are pinned by an active runner).
  *
  * Until that wiring lands, snapshot directories accumulate after
- * enable/disable churn. Hard-link materialization keeps the disk cost low
- * (one inode shared with the catalog), and admins can call
- * `cleanupOrphanRuntime(userId)` directly when they need to reclaim space.
+ * enable/disable churn. copyTreeIsolated keeps the disk cost low on
+ * filesystems that support reflink (APFS / btrfs / xfs — initial near-zero
+ * copy; COW allocates fresh blocks on write); other filesystems fall back to
+ * a plain byte copy. In every case runtime files have an inode independent
+ * from the catalog. Admins can call `cleanupOrphanRuntime(userId)` directly
+ * when they need to reclaim space.
  */
 export function materializeUserRuntime(
   userId: string,
@@ -171,24 +220,21 @@ export function materializeUserRuntime(
       ref.plugin,
     );
 
-    // Already materialized → skip. We treat a manifest-bearing target as
-    // authoritative; partial trees from a crashed run get cleaned up below.
-    if (hasManifest(target)) {
+    // Already materialized AND tree was built with the isolated-inode
+    // strategy → skip. A manifest-only tree predates this strategy
+    // (hard-link era) and must be rebuilt so a host-mode agent's
+    // bypassPermissions write can't mutate the catalog (codex P1).
+    const isolatedAlready =
+      hasManifest(target) &&
+      hasIsolatedRuntimeMarker(
+        userId,
+        ref.snapshot,
+        ref.marketplace,
+        ref.plugin,
+      );
+    if (isolatedAlready) {
       report.reused += 1;
       continue;
-    }
-
-    // Stale partial directory (no manifest) — wipe before re-materializing so
-    // a previous half-copy doesn't leak into the rebuilt tree.
-    if (fs.existsSync(target)) {
-      try {
-        fs.rmSync(target, { recursive: true, force: true });
-      } catch (err) {
-        report.warnings.push(
-          `Could not remove partial target ${target}: ${describe(err)}`,
-        );
-        continue;
-      }
     }
 
     const sourceDir = getSnapshotPath(
@@ -203,14 +249,25 @@ export function materializeUserRuntime(
       continue;
     }
 
+    // Three placement strategies. buildSnapshot builds tmp first either way,
+    // so a failure before the swap leaves the original target untouched.
+    const isLegacy = hasManifest(target); // and !isolatedAlready (above)
+    const isPartial = !isLegacy && fs.existsSync(target);
+
     try {
-      buildSnapshot(sourceDir, target, report);
+      buildSnapshot(sourceDir, target, { isLegacy, isPartial });
       if (!hasManifest(target)) {
         report.warnings.push(
           `Built snapshot at ${target} is missing .claude-plugin/plugin.json`,
         );
         continue;
       }
+      writeIsolatedRuntimeMarker(
+        userId,
+        ref.snapshot,
+        ref.marketplace,
+        ref.plugin,
+      );
       report.built += 1;
     } catch (err) {
       report.warnings.push(
@@ -302,46 +359,84 @@ export function cleanupOrphanRuntime(
 
 // --- Internals ---------------------------------------------------------------
 
+interface BuildPlacement {
+  /**
+   * `target` already has a manifest but no isolated-inode marker — it was
+   * built by the old hard-link materializer. Migrate via rename + backup
+   * rollback so a live host agent's plugin path doesn't disappear under it.
+   */
+  isLegacy: boolean;
+  /**
+   * `target` exists but has no manifest — partial / crashed run. Safe to
+   * `rmSync` before placing tmp; no live agent can be using this incomplete
+   * tree.
+   */
+  isPartial: boolean;
+}
+
 /**
- * Build target tree from sourceDir. Strategy:
- *   1. mkdir parent
- *   2. copy into a `.tmp-` sibling: try recursive hard-links first, fall back
- *      to fs.cpSync(recursive) on EXDEV / EPERM (cross-device or fs that
- *      doesn't allow hard links)
- *   3. rename(2) tmp → target (atomic on the same fs)
+ * Build target tree from sourceDir using copyTreeIsolated, then place into
+ * `target` according to the placement strategy:
+ *   - new install      → rename(tmp → target)
+ *   - partial leftover → rmSync(target); rename(tmp → target)
+ *   - legacy hard-link → rename(target → backup); rename(tmp → target);
+ *                        rmSync(backup). On failure of the second rename we
+ *                        rename backup → target to roll back.
  *
- * Failures clean up the tmp dir before re-throwing so we never leave stray
- * partial trees.
+ * The whole copy + placement runs inside a single try/catch so any failure
+ * (disk full mid-copy, EPERM, source race) cleans tmp before re-throwing.
+ * Without this, an exception during copyTreeIsolated would leave a stray
+ * `.tmp@...` partial tree (codex review).
  */
 function buildSnapshot(
   sourceDir: string,
   target: string,
-  report: MaterializeReport,
+  placement: BuildPlacement,
 ): void {
   fs.mkdirSync(path.dirname(target), { recursive: true });
-  const tmp = `${target}.tmp-${process.pid}-${Date.now()}`;
-
-  let usedFallback = false;
+  // `.tmp@` prefix uses `@` which NAME_SEGMENT_RE rejects, so this can never
+  // be mistaken for a plugin dir by any future scanner.
+  const tmp = `${target}.tmp@${process.pid}-${Date.now()}`;
   try {
-    try {
-      hardLinkTree(sourceDir, tmp);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === 'EXDEV' || code === 'EPERM' || code === 'ENOSYS') {
-        // Cross-device or fs without hard-link support → wipe partial tmp and
-        // copy the bytes instead. Slower but guaranteed-correct.
+    copyTreeIsolated(sourceDir, tmp);
+
+    if (placement.isLegacy) {
+      // `.legacy-bak@` prefix likewise non-NAME_SEGMENT — safe sibling.
+      const backup = `${target}.legacy-bak@${process.pid}-${Date.now()}`;
+      fs.renameSync(target, backup);
+      try {
+        fs.renameSync(tmp, target);
+      } catch (err) {
+        // Roll the original tree back so live host agents see something at
+        // the path. NB: between rename(target→backup) and rollback complete,
+        // an agent reading by path can briefly hit ENOENT — this is shorter
+        // than rmSync(target) but not zero.
         try {
-          fs.rmSync(tmp, { recursive: true, force: true });
+          fs.renameSync(backup, target);
         } catch {
-          /* nothing to clean */
+          /* rollback failed; backup retained for manual recovery */
         }
-        fs.cpSync(sourceDir, tmp, { recursive: true, dereference: false });
-        usedFallback = true;
-      } else {
         throw err;
       }
+      try {
+        fs.rmSync(backup, { recursive: true, force: true });
+      } catch (gcErr) {
+        // Backup is the legacy hard-link tree — still capable of writing
+        // through to catalog if any path references it. The new SDK loader
+        // doesn't (path contains `@` which NAME_SEGMENT_RE rejects), so
+        // residual risk is low but not zero. Log so an operator can clean
+        // up manually.
+        logger.warn(
+          { backup, err: gcErr },
+          'plugin-materializer: legacy backup rmSync failed; retained for manual cleanup (NOT referenced by loader)',
+        );
+      }
+    } else if (placement.isPartial) {
+      fs.rmSync(target, { recursive: true, force: true });
+      fs.renameSync(tmp, target);
+    } else {
+      fs.renameSync(tmp, target);
     }
-    fs.renameSync(tmp, target);
   } catch (err) {
     try {
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -350,20 +445,20 @@ function buildSnapshot(
     }
     throw err;
   }
-
-  if (usedFallback) {
-    report.warnings.push(
-      `Cross-device fallback (fs.cp) used for ${target}`,
-    );
-  }
 }
 
 /**
- * Recursively hard-link every regular file under `src` to a mirrored path
- * under `dst`. Skips symlinks (we don't follow them and don't want to copy
- * dangling refs into runtime).
+ * Recursively copy every regular file under `src` to a mirrored path under
+ * `dst`, with COPYFILE_FICLONE so the kernel reflinks on filesystems that
+ * support it (APFS / btrfs / xfs — initial near-zero copy; COW allocates
+ * fresh blocks on write). Skips symlinks defensively — catalog importer
+ * already skips them at src/plugin-importer.ts:387,418, but a future
+ * upstream slip must not propagate symlinks into runtime. Critical: every
+ * dst file ends up with an independent inode from src so a host-mode
+ * bypassPermissions write through dst cannot mutate the shared catalog
+ * (codex P1).
  */
-function hardLinkTree(src: string, dst: string): void {
+function copyTreeIsolated(src: string, dst: string): void {
   fs.mkdirSync(dst, { recursive: true });
   const entries = fs.readdirSync(src, { withFileTypes: true });
   for (const ent of entries) {
@@ -371,12 +466,75 @@ function hardLinkTree(src: string, dst: string): void {
     const dAbs = path.join(dst, ent.name);
     if (ent.isSymbolicLink()) continue;
     if (ent.isDirectory()) {
-      hardLinkTree(sAbs, dAbs);
+      copyTreeIsolated(sAbs, dAbs);
       continue;
     }
     if (ent.isFile()) {
-      fs.linkSync(sAbs, dAbs);
+      // FICLONE (NOT FICLONE_FORCE): try reflink, fall back to plain copy
+      // when the filesystem doesn't support it. FORCE would throw on ext4.
+      fs.copyFileSync(sAbs, dAbs, fs.constants.COPYFILE_FICLONE);
     }
+  }
+}
+
+/** runtime/{userId}/snapshots/{snapshotId}/@happyclaw-runtime-markers/{mp}/{plugin}.json */
+function getRuntimeMarkerPath(
+  userId: string,
+  snapshotId: string,
+  marketplace: string,
+  plugin: string,
+): string {
+  // marketplace / plugin segments are validated by callers (plugin name
+  // segments arrive via materializeUserRuntime's per-entry isValidNameSegment
+  // gate); snapshotId is validated by getUserSnapshotDir.
+  return path.join(
+    getUserSnapshotDir(userId, snapshotId),
+    MARKER_DIRNAME,
+    marketplace,
+    `${plugin}.json`,
+  );
+}
+
+function writeIsolatedRuntimeMarker(
+  userId: string,
+  snapshotId: string,
+  marketplace: string,
+  plugin: string,
+): void {
+  const file = getRuntimeMarkerPath(userId, snapshotId, marketplace, plugin);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const marker: RuntimeMarker = {
+    materializerVersion: RUNTIME_MARKER_VERSION,
+    copyMode: 'copyfile_ficlone',
+    isolatedInodes: true,
+    builtAt: new Date().toISOString(),
+  };
+  // Atomic rename so concurrent readers never see a half-written marker
+  // (write the JSON body to a sibling tmp first, then rename into place).
+  const tmp = `${file}.tmp@${process.pid}-${Date.now()}`;
+  fs.writeFileSync(tmp, JSON.stringify(marker) + '\n', 'utf-8');
+  fs.renameSync(tmp, file);
+}
+
+function hasIsolatedRuntimeMarker(
+  userId: string,
+  snapshotId: string,
+  marketplace: string,
+  plugin: string,
+): boolean {
+  try {
+    const raw = fs.readFileSync(
+      getRuntimeMarkerPath(userId, snapshotId, marketplace, plugin),
+      'utf-8',
+    );
+    const parsed = JSON.parse(raw) as Partial<RuntimeMarker>;
+    return (
+      parsed.materializerVersion === RUNTIME_MARKER_VERSION &&
+      parsed.copyMode === 'copyfile_ficlone' &&
+      parsed.isolatedInodes === true
+    );
+  } catch {
+    return false;
   }
 }
 
