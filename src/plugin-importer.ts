@@ -278,7 +278,7 @@ interface ImportPluginArgs {
 async function importPluginSnapshot(args: ImportPluginArgs): Promise<void> {
   const { marketplace, plugin, pluginDir, manifest, idx, report } = args;
 
-  const contentHash = hashDirectoryContents(pluginDir);
+  const contentHash = await hashDirectoryContents(pluginDir);
   const snapshotId = `sha256-${contentHash.slice(0, 32)}`;
   const targetDir = getCatalogSnapshotDir(marketplace, plugin, snapshotId);
   const fullId = buildFullId(plugin, marketplace);
@@ -346,7 +346,7 @@ async function importPluginSnapshot(args: ImportPluginArgs): Promise<void> {
  * Hash domain: relative file path + null + raw content + null. Symlinks are
  * skipped (hash is content-only; the importer also doesn't copy symlinks).
  */
-export function hashDirectoryContents(rootDir: string): string {
+export async function hashDirectoryContents(rootDir: string): Promise<string> {
   const hash = crypto.createHash('sha256');
   const entries = collectFiles(rootDir, '');
   // Sorted by relative path for determinism across filesystems.
@@ -354,7 +354,19 @@ export function hashDirectoryContents(rootDir: string): string {
   for (const e of entries) {
     hash.update(e.rel);
     hash.update('\0');
-    hash.update(fs.readFileSync(e.abs));
+    // Stream the file rather than fs.readFileSync — large hooks/scripts
+    // (binaries, embedded assets) shouldn't pull whole files into memory.
+    // Byte stream identical to the legacy readFileSync path: each chunk
+    // is fed to hash.update() in order, so the resulting digest is
+    // byte-for-byte equivalent (verified by the compat regression test).
+    await new Promise<void>((resolve, reject) => {
+      const stream = fs.createReadStream(e.abs);
+      stream.on('data', (chunk: Buffer | string) => {
+        hash.update(chunk);
+      });
+      stream.on('end', () => resolve());
+      stream.on('error', reject);
+    });
     hash.update('\0');
   }
   return hash.digest('hex');

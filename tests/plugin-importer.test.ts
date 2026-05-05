@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -69,7 +70,7 @@ afterEach(() => {
 });
 
 describe('hashDirectoryContents', () => {
-  test('produces stable hash + ignores .git/.DS_Store/node_modules', () => {
+  test('produces stable hash + ignores .git/.DS_Store/node_modules', async () => {
     const a = fs.mkdtempSync(path.join(os.tmpdir(), 'hd-a-'));
     const b = fs.mkdtempSync(path.join(os.tmpdir(), 'hd-b-'));
     try {
@@ -87,23 +88,86 @@ describe('hashDirectoryContents', () => {
       fs.mkdirSync(path.join(b, 'node_modules', 'foo'), { recursive: true });
       fs.writeFileSync(path.join(b, 'node_modules', 'foo', 'pkg.js'), 'x');
 
-      expect(hashDirectoryContents(a)).toBe(hashDirectoryContents(b));
+      expect(await hashDirectoryContents(a)).toBe(await hashDirectoryContents(b));
     } finally {
       fs.rmSync(a, { recursive: true, force: true });
       fs.rmSync(b, { recursive: true, force: true });
     }
   });
 
-  test('hash differs when content changes', () => {
+  test('hash differs when content changes', async () => {
     const a = fs.mkdtempSync(path.join(os.tmpdir(), 'hd-c-'));
     try {
       fs.writeFileSync(path.join(a, 'one.md'), 'first');
-      const h1 = hashDirectoryContents(a);
+      const h1 = await hashDirectoryContents(a);
       fs.writeFileSync(path.join(a, 'one.md'), 'second');
-      const h2 = hashDirectoryContents(a);
+      const h2 = await hashDirectoryContents(a);
       expect(h1).not.toBe(h2);
     } finally {
       fs.rmSync(a, { recursive: true, force: true });
+    }
+  });
+
+  test('stream hash matches the legacy readFileSync algorithm byte-for-byte', async () => {
+    // CRITICAL: hashDirectoryContents output is the snapshotId. If the new
+    // streaming algorithm diverges from the old readFileSync algorithm by
+    // even a single byte, every existing user's plugin snapshot would be
+    // identified as a new version → catalog mass rebuild. This test pins
+    // byte-equivalence between the two implementations across realistic
+    // plugin shapes (small text, medium binary, large binary).
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hd-compat-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'small.md'), 'hello');
+      fs.mkdirSync(path.join(dir, 'sub'));
+      fs.writeFileSync(path.join(dir, 'sub', 'medium.txt'), Buffer.alloc(64 * 1024, 0x42));
+      fs.writeFileSync(path.join(dir, 'large.bin'), Buffer.alloc(2 * 1024 * 1024, 0xab));
+
+      // Legacy algorithm reproduced inline. Mirrors src/plugin-importer.ts
+      // pre-stream behaviour, including HASH_EXCLUDES and the
+      // lstatSync + skip-symlink directory walk (statSync would follow
+      // symlinks and silently diverge from the production algorithm).
+      function legacyHash(rootDir: string): string {
+        const hash = crypto.createHash('sha256');
+        const entries: { rel: string; abs: string }[] = [];
+        function walk(prefix: string) {
+          const names = fs.readdirSync(path.join(rootDir, prefix));
+          for (const name of names) {
+            if (name === '.git' || name === '.DS_Store' || name === 'node_modules') continue;
+            const rel = prefix ? `${prefix}/${name}` : name;
+            const abs = path.join(rootDir, rel);
+            const stat = fs.lstatSync(abs);
+            if (stat.isSymbolicLink()) continue;
+            if (stat.isDirectory()) walk(rel);
+            else if (stat.isFile()) entries.push({ rel, abs });
+          }
+        }
+        walk('');
+        entries.sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+        for (const e of entries) {
+          hash.update(e.rel);
+          hash.update('\0');
+          hash.update(fs.readFileSync(e.abs));
+          hash.update('\0');
+        }
+        return hash.digest('hex');
+      }
+
+      const expected = legacyHash(dir);
+      const actual = await hashDirectoryContents(dir);
+      expect(actual).toBe(expected);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('hashes large files through the stream path', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hd-stream-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'big.bin'), Buffer.alloc(8 * 1024 * 1024, 0xcd));
+      const h = await hashDirectoryContents(dir);
+      expect(h).toMatch(/^[0-9a-f]{64}$/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 });
