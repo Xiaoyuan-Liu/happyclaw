@@ -96,7 +96,11 @@ import {
   ASSISTANT_NAME,
 } from './config.js';
 import { logger } from './logger.js';
-import { executeSessionReset } from './commands.js';
+import {
+  executeSessionReset,
+  isClearCommand,
+  SESSION_RESET_FAILURE_MESSAGE,
+} from './commands.js';
 import {
   normalizeImageAttachments,
   toAgentImages,
@@ -214,6 +218,47 @@ app.post('/api/messages', authMiddleware, async (c) => {
       { error: 'Insufficient permissions for host execution mode' },
       403,
     );
+  }
+
+  // /clear: reset session without entering message pipeline.
+  // Permission: relies on the route-level canAccessGroup + host-mode checks above.
+  // Whether to tighten /clear to owner-only is left to the follow-up ACL audit
+  // (see PR description) — keeping it aligned with send-message for now.
+  if (isClearCommand(content)) {
+    if (!deps) return c.json({ error: 'Server not initialized' }, 500);
+    try {
+      await executeSessionReset(chatJid, group.folder, {
+        queue: deps.queue,
+        sessions: deps.getSessions(),
+        broadcast: broadcastNewMessage,
+        setLastAgentTimestamp: deps.setLastAgentTimestamp,
+      });
+      return c.json({ success: true, cleared: true });
+    } catch (err) {
+      logger.error({ chatJid, err }, '/clear command failed');
+      const errId = crypto.randomUUID();
+      const errTs = new Date().toISOString();
+      ensureChatExists(chatJid);
+      storeMessageDirect(
+        errId,
+        chatJid,
+        '__system__',
+        'system',
+        SESSION_RESET_FAILURE_MESSAGE,
+        errTs,
+        true,
+      );
+      broadcastNewMessage(chatJid, {
+        id: errId,
+        chat_jid: chatJid,
+        sender: '__system__',
+        sender_name: 'system',
+        content: SESSION_RESET_FAILURE_MESSAGE,
+        timestamp: errTs,
+        is_from_me: true,
+      });
+      return c.json({ error: '清除上下文失败' }, 500);
+    }
   }
 
   const result = await handleWebUserMessage(
@@ -829,6 +874,70 @@ function setupWebSocket(server: any): WebSocketServer {
             return;
           }
 
+          // ── /clear command: reset session without entering message pipeline ──
+          // Must run before the agentId early return so /clear in a sub-agent tab
+          // resets the agent session (passing agentId) instead of being delivered
+          // to the agent as plain text.
+          // Permission: relies on the canAccessGroup + host-mode checks above
+          // (kept aligned with send-message; ACL tightening tracked in follow-up).
+          // Success has no explicit ws_error/ack — the client sees the reset
+          // through the broadcastNewMessage(context_reset) push from executeSessionReset.
+          if (isClearCommand(content) && deps && targetGroup) {
+            // Validate agentId before passing to executeSessionReset →
+            // clearSessionFiles, which interpolates agentId into a filesystem
+            // path. Mirrors the reset-session route's check (routes/groups.ts).
+            if (agentId) {
+              const agent = getAgent(agentId);
+              if (!agent || agent.chat_jid !== chatJid) {
+                sendWsError('Agent not found', chatJid);
+                return;
+              }
+            }
+            const errorTargetJid = agentId
+              ? `${chatJid}#agent:${agentId}`
+              : chatJid;
+            try {
+              await executeSessionReset(
+                chatJid,
+                targetGroup.folder,
+                {
+                  queue: deps.queue,
+                  sessions: deps.getSessions(),
+                  broadcast: broadcastNewMessage,
+                  setLastAgentTimestamp: deps.setLastAgentTimestamp,
+                },
+                agentId,
+              );
+            } catch (err) {
+              logger.error(
+                { chatJid, agentId, err },
+                '/clear command failed',
+              );
+              const errId = crypto.randomUUID();
+              const errTs = new Date().toISOString();
+              ensureChatExists(errorTargetJid);
+              storeMessageDirect(
+                errId,
+                errorTargetJid,
+                '__system__',
+                'system',
+                SESSION_RESET_FAILURE_MESSAGE,
+                errTs,
+                true,
+              );
+              broadcastNewMessage(errorTargetJid, {
+                id: errId,
+                chat_jid: errorTargetJid,
+                sender: '__system__',
+                sender_name: 'system',
+                content: SESSION_RESET_FAILURE_MESSAGE,
+                timestamp: errTs,
+                is_from_me: true,
+              });
+            }
+            return;
+          }
+
           // Route to agent conversation handler if agentId is present
           if (agentId && deps) {
             await handleAgentConversationMessage(
@@ -839,45 +948,6 @@ function setupWebSocket(server: any): WebSocketServer {
               session.display_name || session.username,
               attachments,
             );
-            return;
-          }
-
-          // ── /clear command: reset session without entering message pipeline ──
-          if (content.trim().toLowerCase() === '/clear' && deps) {
-            const targetGroup = getRegisteredGroup(chatJid);
-            if (targetGroup) {
-              try {
-                await executeSessionReset(chatJid, targetGroup.folder, {
-                  queue: deps.queue,
-                  sessions: deps.getSessions(),
-                  broadcast: broadcastNewMessage,
-                  setLastAgentTimestamp: deps.setLastAgentTimestamp,
-                });
-              } catch (err) {
-                logger.error({ chatJid, err }, '/clear command failed');
-                const errId = crypto.randomUUID();
-                const errTs = new Date().toISOString();
-                ensureChatExists(chatJid);
-                storeMessageDirect(
-                  errId,
-                  chatJid,
-                  '__system__',
-                  'system',
-                  'system_error:清除上下文失败，请稍后重试',
-                  errTs,
-                  true,
-                );
-                broadcastNewMessage(chatJid, {
-                  id: errId,
-                  chat_jid: chatJid,
-                  sender: '__system__',
-                  sender_name: 'system',
-                  content: 'system_error:清除上下文失败，请稍后重试',
-                  timestamp: errTs,
-                  is_from_me: true,
-                });
-              }
-            }
             return;
           }
 
