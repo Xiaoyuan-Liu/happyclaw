@@ -24,6 +24,51 @@
 
 import { spawn } from 'child_process';
 
+import { logger } from './logger.js';
+
+/**
+ * Structured metric event name for inline bash executions. Goes into pino
+ * logs as a stable identifier so external aggregators can build counters
+ * (by `outcome`) and histograms (by `durationMs`) without the project
+ * needing a dedicated metrics framework (PR#487 review #8).
+ */
+const METRIC_EVENT = 'plugin_inline_exec';
+
+function deriveOutcome(
+  r: InlineExecResult,
+): 'success' | 'failure' | 'timeout' | 'spawn_error' {
+  // timedOut wins over spawnError: a SIGKILL after grace can populate both
+  // fields (child died with a 'spawn error' style symptom while we were
+  // already in the timeout path). Mirroring the user-facing message order
+  // keeps log outcomes consistent (codex follow-up).
+  if (r.timedOut) return 'timeout';
+  if (r.spawnError) return 'spawn_error';
+  if (r.ok) return 'success';
+  return 'failure';
+}
+
+function logInlineMetric(
+  executionMode: 'host' | 'container',
+  cmdLength: number,
+  durationMs: number,
+  result: InlineExecResult,
+): void {
+  logger.info(
+    {
+      event: METRIC_EVENT,
+      outcome: deriveOutcome(result),
+      executionMode,
+      cmdLength,
+      durationMs,
+      exitCode: result.exitCode,
+      timedOut: result.timedOut,
+      // NB: rawCmd is intentionally NOT logged — agent-supplied shell strings
+      // can carry tokens / PII / private paths.
+    },
+    'plugin inline bash exec',
+  );
+}
+
 /** Default budget for an inline `!` template — matches plan §Step 4. */
 export const INLINE_TIMEOUT_MS = 30000;
 /**
@@ -225,7 +270,7 @@ function runChildProcess(
  * `cwd` is the absolute working directory passed to bash; agent-runner runs
  * with `cwd = data/groups/{folder}` so that's what callers pass here.
  */
-export function executeInlineBashHost(
+export async function executeInlineBashHost(
   rawCmdString: string,
   posArgs: string[],
   env: InlineEnvVars,
@@ -239,14 +284,17 @@ export function executeInlineBashHost(
   };
   // bash -c '<cmd>' -- a b c   →  $1=a $2=b $3=c
   const args = ['-c', rawCmdString, '--', ...posArgs];
-  return runChildProcess('bash', args, childEnv, cwd, opts);
+  const startedAt = Date.now();
+  const result = await runChildProcess('bash', args, childEnv, cwd, opts);
+  logInlineMetric('host', rawCmdString.length, Date.now() - startedAt, result);
+  return result;
 }
 
 /**
  * Execute an inline `!` template inside the user's docker container.
  * Caller has already verified `containerName` is non-null (active runner).
  */
-export function executeInlineBashDocker(
+export async function executeInlineBashDocker(
   containerName: string,
   rawCmdString: string,
   posArgs: string[],
@@ -273,5 +321,10 @@ export function executeInlineBashDocker(
   ];
   // env passthrough for docker is via -e flags; child env is the orchestrator's
   // own env (ignored by docker exec).
-  return runChildProcess('docker', args, undefined, undefined, opts);
+  const startedAt = Date.now();
+  const result = await runChildProcess('docker', args, undefined, undefined, opts);
+  // executionMode is 'container' (NOT 'docker') to align with
+  // ExpandContext.executionMode / ExecutionMode enum and avoid log enum split.
+  logInlineMetric('container', rawCmdString.length, Date.now() - startedAt, result);
+  return result;
 }

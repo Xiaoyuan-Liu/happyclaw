@@ -15,13 +15,30 @@
  */
 
 import { EventEmitter } from 'events';
-import { describe, expect, test, vi } from 'vitest';
+import { beforeEach, describe, expect, test, vi } from 'vitest';
 
+// 1) Mock logger BEFORE importing the module under test. Vitest hoists
+//    vi.mock automatically, but keeping it visually above the import
+//    documents the intent: every executeInlineBash* call in this file
+//    fires logger.info via the new metric path; without this mock the
+//    real pino logger would write JSON to stdout for every test case.
+vi.mock('../src/logger.js', () => ({
+  logger: {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+  },
+}));
+
+import { logger as mockedLogger } from '../src/logger.js';
 import {
   executeInlineBashHost,
   executeInlineBashDocker,
   INLINE_TIMEOUT_MS,
 } from '../src/plugin-inline-bash.js';
+
+const infoMock = vi.mocked(mockedLogger.info);
 
 // --- Stub spawn that records argv + lets the test drive lifecycle ---------
 
@@ -384,5 +401,125 @@ describe('executeInlineBashDocker', () => {
 describe('module defaults', () => {
   test('INLINE_TIMEOUT_MS is 30s per spec', () => {
     expect(INLINE_TIMEOUT_MS).toBe(30_000);
+  });
+});
+
+// --- Structured metric log (PR#487 review #8) -----------------------------
+
+describe('plugin-inline-bash structured metric log', () => {
+  beforeEach(() => {
+    infoMock.mockClear();
+  });
+
+  function findMetricCall() {
+    return infoMock.mock.calls.find(
+      (c) =>
+        typeof c[0] === 'object' &&
+        c[0] !== null &&
+        (c[0] as { event?: string }).event === 'plugin_inline_exec',
+    );
+  }
+
+  test('logs success outcome for clean exit 0', async () => {
+    const stub = makeSpawnStub();
+    const promise = executeInlineBashHost(
+      'echo hi',
+      [],
+      { CLAUDE_PLUGIN_ROOT: '/p', ARGUMENTS: '' },
+      '/tmp',
+      { spawnImpl: stub.spawnFn },
+    );
+    setImmediate(() => stub.getLastChild().emitter.emit('close', 0, null));
+    await promise;
+    const call = findMetricCall();
+    expect(call?.[0]).toMatchObject({
+      event: 'plugin_inline_exec',
+      outcome: 'success',
+      executionMode: 'host',
+    });
+  });
+
+  test('logs failure outcome for non-zero exit', async () => {
+    const stub = makeSpawnStub();
+    const promise = executeInlineBashHost(
+      'false',
+      [],
+      { CLAUDE_PLUGIN_ROOT: '/p', ARGUMENTS: '' },
+      '/tmp',
+      { spawnImpl: stub.spawnFn },
+    );
+    setImmediate(() => stub.getLastChild().emitter.emit('close', 7, null));
+    await promise;
+    const call = findMetricCall();
+    expect(call?.[0]).toMatchObject({ outcome: 'failure', exitCode: 7 });
+  });
+
+  test('logs timeout outcome when watchdog fires', async () => {
+    const stub = makeSpawnStub();
+    const promise = executeInlineBashHost(
+      'sleep 5',
+      [],
+      { CLAUDE_PLUGIN_ROOT: '/p', ARGUMENTS: '' },
+      '/tmp',
+      { timeoutMs: 10, killGraceMs: 10, spawnImpl: stub.spawnFn },
+    );
+    // Watchdog will SIGTERM the stub child; the child's kill() emits close
+    // with timedOut already set by the runner.
+    await promise;
+    const call = findMetricCall();
+    expect(call?.[0]).toMatchObject({ outcome: 'timeout' });
+  });
+
+  test('logs spawn_error outcome when spawn throws', async () => {
+    const promise = executeInlineBashHost(
+      ':',
+      [],
+      { CLAUDE_PLUGIN_ROOT: '/p', ARGUMENTS: '' },
+      '/tmp',
+      {
+        spawnImpl: ((): never => {
+          throw new Error('ENOENT');
+        }) as unknown as typeof import('child_process').spawn,
+      },
+    );
+    await promise;
+    const call = findMetricCall();
+    expect(call?.[0]).toMatchObject({ outcome: 'spawn_error' });
+  });
+
+  test('does not log raw command content', async () => {
+    const stub = makeSpawnStub();
+    const secret = 'echo SECRET_TOKEN_123';
+    const promise = executeInlineBashHost(
+      secret,
+      [],
+      { CLAUDE_PLUGIN_ROOT: '/p', ARGUMENTS: '' },
+      '/tmp',
+      { spawnImpl: stub.spawnFn },
+    );
+    setImmediate(() => stub.getLastChild().emitter.emit('close', 0, null));
+    await promise;
+    const call = findMetricCall();
+    const json = JSON.stringify(call?.[0]);
+    expect(json).not.toContain('SECRET_TOKEN_123');
+    expect((call?.[0] as { cmdLength: number }).cmdLength).toBe(secret.length);
+  });
+
+  test('records executionMode container for docker variant', async () => {
+    const stub = makeSpawnStub();
+    const promise = executeInlineBashDocker(
+      'hc-test',
+      ':',
+      [],
+      { CLAUDE_PLUGIN_ROOT: '/p', ARGUMENTS: '' },
+      { spawnImpl: stub.spawnFn },
+    );
+    setImmediate(() => stub.getLastChild().emitter.emit('close', 0, null));
+    await promise;
+    const call = findMetricCall();
+    expect(call?.[0]).toMatchObject({
+      outcome: 'success',
+      executionMode: 'container',
+    });
   });
 });
