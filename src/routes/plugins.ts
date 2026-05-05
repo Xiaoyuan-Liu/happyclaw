@@ -38,6 +38,7 @@ import {
   buildCommandIndex,
   invalidateUserCommandIndex,
 } from '../plugin-command-index.js';
+import { logger } from '../logger.js';
 
 const pluginsRoutes = new Hono<{ Variables: Variables }>();
 
@@ -357,9 +358,17 @@ pluginsRoutes.post('/materialize', authMiddleware, async (c) => {
   }
 });
 
-// DELETE /marketplaces/:name — cascade-clear all enabled[*@name] from v2
-// plugins.json. Re-materialize so orphan runtime trees can be cleaned up by
-// the next GC pass.
+/**
+ * DELETE /marketplaces/:name
+ *
+ * @semantics per-caller only, never touches the immutable catalog.
+ * Cascade-clears `enabled.*@{name}` from the caller's v2 plugins.json
+ * and re-materializes their runtime so orphan trees can be GC'd.
+ *
+ * NOTE: This is NOT a catalog deletion. The shared catalog (admin-imported,
+ * content-hash-addressed) is intentionally untouched — other users with
+ * `enabled.*@{name}` refs continue to see and use the marketplace.
+ */
 pluginsRoutes.delete('/marketplaces/:name', authMiddleware, async (c) => {
   const authUser = c.get('user') as AuthUser;
   const name = c.req.param('name');
@@ -388,6 +397,15 @@ pluginsRoutes.delete('/marketplaces/:name', authMiddleware, async (c) => {
         // best-effort; user can hit POST /materialize manually
       }
       invalidateUserCommandIndex(authUser.id);
+      logger.info(
+        {
+          event: 'plugin_marketplace_unenabled',
+          userId: authUser.id,
+          marketplace: name,
+          removedEnabled,
+        },
+        'plugin marketplace dropped from caller refs (catalog NOT touched)',
+      );
     }
   }
 

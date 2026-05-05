@@ -92,7 +92,7 @@
 | `POST` | `/api/plugins/catalog/scan` | admin (`manage_system_config`) | 触发宿主机 `~/.claude/plugins/marketplaces/` 扫描并入 catalog；返回 `ImportReport`（`marketplaces` / `plugins` / `created` / `skipped`）。主进程启动 5s 后 + 每小时自动调用同一逻辑 |
 | `PATCH` | `/api/plugins/enabled/:fullId` | 登录 | body `{ enabled: boolean }`，read-modify-write `users/{userId}/plugins.json`；启用时自动 `materializeUserRuntime` 写入 `runtime/{userId}/snapshots/{snapshotId}/`；UI 必须提示"下次新会话生效" |
 | `POST` | `/api/plugins/materialize` | 登录 | 手动重建当前用户的 runtime snapshot（用于 catalog 更新后强制刷新） |
-| `DELETE` | `/api/plugins/marketplaces/:name` | 登录 | 仅清除调用者自己的 `enabled.*@{name}` 引用，**不删** catalog（catalog 是共享只读集合） |
+| `DELETE` | `/api/plugins/marketplaces/:name` | 登录 | **NOT a catalog deletion** — 仅清理调用者自己的 `enabled.*@{name}` 引用，共享只读 catalog 不动（admin 共享导入、按内容 hash 寻址） |
 
 **已废弃**（PR1 删除，新代码不要引用）：~~`POST /api/plugins/sync-host`~~、~~`GET /api/plugins/available-on-host`~~。
 
