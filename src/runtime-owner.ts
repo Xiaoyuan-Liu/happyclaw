@@ -60,7 +60,7 @@ export function resolveLatestAdminSenderOverride(
  * && isHome` gate that all three call sites previously inlined.
  *
  * `chatJid` may be a virtual JID (`web:main#agent:<id>`) — the gate checks the
- * base JID before the first `#`, mirroring `resolvePluginRuntimeOwner`.
+ * base JID before the first `#` (mirrors the legacy virtual-JID base check).
  */
 export function resolveAdminSharedRuntimeOwner(args: {
   chatJid: string;

@@ -34,10 +34,8 @@
 
 import { describe, expect, test } from 'vitest';
 
-import {
-  makeExpandContext,
-  resolvePluginRuntimeOwner,
-} from '../src/plugin-command-expander.js';
+import { makeExpandContext } from '../src/plugin-command-expander.js';
+import { resolvePluginRuntimeOwner } from './helpers/legacy-runtime-owner.js';
 
 // ─── P2-bug-4: makeExpandContext customCwd in host mode ─────────────────────
 

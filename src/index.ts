@@ -5819,7 +5819,7 @@ async function processAgentConversation(
     // owner for the whole batch (#23 round-15 P2-2). The per-message
     // resolver strips the `#agent:` suffix from the virtual JID before
     // the `web:main` gate so virtual JIDs still get the per-sender
-    // semantics (matches `resolvePluginRuntimeOwner`).
+    // semantics (matches the legacy virtual-JID base resolver).
     const fallbackExpandCtx = buildExpandContext(
       virtualChatJid,
       effectiveGroup,

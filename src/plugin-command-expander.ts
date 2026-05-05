@@ -239,42 +239,6 @@ export function makeExpandContext(args: {
   };
 }
 
-/**
- * Resolve runtime owner with admin-shared `web:main` sender precedence.
- *
- * On the admin-shared web:main workspace, plugin runtime is per-user so the
- * message sender is the correct owner — `group.created_by` is just whichever
- * admin first materialised the group (#18 P2-bug-5). On other workspaces
- * (single-owner home / member groups) `created_by` wins.
- *
- * Agent conversation tabs use a virtual jid `web:main#agent:<id>` — strip the
- * `#agent:` suffix before checking the web:main shared-home special case so
- * each admin's plugin runtime resolves to themselves rather than whichever
- * admin first materialised the parent group (#19 P2-5).
- *
- * @deprecated Use `resolvePerMessageRuntimeOwner` from `runtime-owner.ts`
- * instead — that helper additionally admin-gates the sender (active +
- * role=admin) so non-admin senders on `web:main + isHome` correctly fall
- * back to `created_by` like the cold-start path. Pre-fix divergence (#24
- * round-16 P2-1) made the same `/foo` command behave differently when the
- * runner was active vs idle. This export remains for the routing-bugs
- * regression tests that exercise the legacy precedence rule directly.
- */
-export function resolvePluginRuntimeOwner(args: {
-  groupJid: string;
-  isHome?: boolean | null;
-  createdBy?: string | null;
-  senderUserId?: string | null;
-}): string | null {
-  const hashIdx = args.groupJid.indexOf('#');
-  const baseJid = hashIdx >= 0 ? args.groupJid.slice(0, hashIdx) : args.groupJid;
-  const isAdminSharedHome = baseJid === 'web:main' && args.isHome === true;
-  const owner = isAdminSharedHome
-    ? (args.senderUserId ?? args.createdBy ?? null)
-    : (args.createdBy ?? args.senderUserId ?? null);
-  return owner || null;
-}
-
 // --- Plugin runtime path resolution ----------------------------------------
 
 /**
