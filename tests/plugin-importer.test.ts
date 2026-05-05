@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { Readable } from 'stream';
 
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 
@@ -171,6 +172,37 @@ describe('hashDirectoryContents', () => {
       fs.writeFileSync(path.join(dir, 'big.bin'), Buffer.alloc(8 * 1024 * 1024, 0xcd));
       const h = await hashDirectoryContents(dir);
       expect(h).toMatch(/^[0-9a-f]{64}$/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('rejects (does not crash) when the stream emits a string chunk', async () => {
+    // Defensive guard: hashDirectoryContents pins chunks to Buffer by
+    // setting highWaterMark and not passing encoding. If a future caller
+    // flips the encoding upstream and a string chunk reaches the 'data'
+    // handler, the implementation calls stream.destroy(err) so the
+    // 'error' listener rejects the outer Promise. A naive `throw` from
+    // the listener would surface as uncaughtException and crash the
+    // host process — this test pins that behaviour so the safety
+    // contract can't regress silently.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hd-guard-'));
+    try {
+      fs.writeFileSync(path.join(dir, 'one.txt'), 'data');
+      const spy = vi
+        .spyOn(fs, 'createReadStream')
+        .mockImplementation(
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          ((..._args: unknown[]) =>
+            Readable.from(['this-should-be-a-buffer-but-isnt'])) as any,
+        );
+      try {
+        await expect(hashDirectoryContents(dir)).rejects.toThrow(
+          /string chunk/i,
+        );
+      } finally {
+        spy.mockRestore();
+      }
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
