@@ -8362,22 +8362,31 @@ async function main(): Promise<void> {
   loadState();
 
   // Plugin catalog scan: one shot 5s after startup + every 1h thereafter.
-  // scanHostMarketplaces has an in-flight Promise mutex, so UI button /
-  // startup / periodic timer can overlap safely.
-  const startupPluginScanTimer = setTimeout(() => {
-    scanHostMarketplaces().catch((err) =>
-      logger.warn({ err }, 'startup plugin catalog scan failed'),
-    );
-  }, 5000);
-
-  const periodicPluginScanInterval = setInterval(
-    () => {
+  // Disabled when SystemSettings.pluginAutoScan = false; admin can still
+  // trigger via POST /api/plugins/catalog/scan. scanHostMarketplaces has
+  // an in-flight Promise mutex, so UI button / startup / periodic timer
+  // can overlap safely.
+  // NOTE: this runs once at startup; runtime toggle requires restart.
+  let startupPluginScanTimer: ReturnType<typeof setTimeout> | null = null;
+  let periodicPluginScanInterval: ReturnType<typeof setInterval> | null = null;
+  if (getSystemSettings().pluginAutoScan) {
+    startupPluginScanTimer = setTimeout(() => {
       scanHostMarketplaces().catch((err) =>
-        logger.warn({ err }, 'periodic plugin catalog scan failed'),
+        logger.warn({ err }, 'startup plugin catalog scan failed'),
       );
-    },
-    60 * 60 * 1000,
-  );
+    }, 5000);
+
+    periodicPluginScanInterval = setInterval(
+      () => {
+        scanHostMarketplaces().catch((err) =>
+          logger.warn({ err }, 'periodic plugin catalog scan failed'),
+        );
+      },
+      60 * 60 * 1000,
+    );
+  } else {
+    logger.info('Plugin catalog auto-scan disabled by SystemSettings.pluginAutoScan');
+  }
 
   // --- Channel reload helpers (hot-reload on config save) ---
 
@@ -8409,8 +8418,8 @@ async function main(): Promise<void> {
       feishuSyncInterval = null;
     }
 
-    clearTimeout(startupPluginScanTimer);
-    clearInterval(periodicPluginScanInterval);
+    if (startupPluginScanTimer) clearTimeout(startupPluginScanTimer);
+    if (periodicPluginScanInterval) clearInterval(periodicPluginScanInterval);
 
     try {
       ipcWatcherManager?.closeAll();

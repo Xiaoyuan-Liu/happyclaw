@@ -105,6 +105,7 @@ export interface SystemSettings {
   externalClaudeDir: string;
   autoCompactWindow: number;
   disableMemoryLayerForAdminHost: boolean;
+  pluginAutoScan: boolean;
 }
 
 // ─── OAuth Usage ────────────────────────────────────────────

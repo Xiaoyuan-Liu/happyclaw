@@ -576,7 +576,7 @@ WebSocket：`/ws`（协议详见 §3.6）。
   - **Runtime versioned snapshot**：`runtime/{userId}/snapshots/{snapshotId}/...` 是用户视角的版本化只读视图。启用新版本只切用户配置（`users/{userId}/plugins.json`），旧会话继续读旧 snapshot 直到 GC，避免运行中读到半写入目录
   - **`PATCH /enabled` 走 mcp 范式**：read-modify-write 单 schema，无 v1→v2 接管路径（v1 cache 布局已删除，存量用户首次访问 enabled 列表为空属预期）
   - **container-runner 双路径预构建**：host / docker spawn 之前都先 `materializeUserRuntime(ownerId)`；`prepareHostPlugins` helper 与 `buildVolumeMounts` 内联 materialize **必须对称**，否则两条路径会出现 runtime 不一致
-  - **自动 scan 是系统行为**：admin 在宿主机安装 / 更新的 plugin marketplace 会在主进程启动 5s 后 + 每小时自动入 catalog（`POST /api/plugins/catalog/scan` 也手动触发同一逻辑），对所有 member 可见可启用。如未来需"admin 点按钮才确认入 catalog"，可加 `plugins.autoImportEnabled` 系统设置项；本期默认开启
+  - **自动 scan 默认开启**：admin 在宿主机安装 / 更新的 plugin marketplace 会在主进程启动 5s 后 + 每小时自动入 catalog（`POST /api/plugins/catalog/scan` 也手动触发同一逻辑），对所有 member 可见可启用。可通过系统设置 `SystemSettings.pluginAutoScan = false` 关闭定时扫描（admin 仍可手动点 `POST /api/plugins/catalog/scan`），适用于不希望本机私有 plugin 自动入共享 catalog 的环境。注意：定时器仅在主进程启动时按当前值注册一次，运行时切换需重启服务才能生效
   - **v3 时代 endpoint 已废**：`POST /api/plugins/sync-host` 与 `GET /api/plugins/available-on-host` 已在 PR1 删除，新代码不要再引用
 
 ### 10.1 Issue / PR 规范
