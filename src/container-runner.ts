@@ -44,6 +44,7 @@ import {
   type SdkPluginConfig,
 } from './plugin-utils.js';
 import { materializeUserRuntime } from './plugin-materializer.js';
+import { invalidateUserCommandIndex } from './plugin-command-index.js';
 import {
   checkHostCapabilities,
   logCapabilityPreflight,
@@ -403,6 +404,11 @@ export function prepareHostPlugins(ownerId: string | null | undefined): SdkPlugi
       'prepareHostPlugins: materializeUserRuntime failed; host agent will see no plugins',
     );
   }
+  // Drop the user's command index cache so a stale empty entry (e.g. a prior
+  // /commands hit before runtime existed, see plugin-command-index.ts:235) is
+  // rebuilt against the now-materialized tree. Invalidate on both success and
+  // failure paths: a partial materialize still wants the cache rebuilt.
+  invalidateUserCommandIndex(ownerId);
   return loadUserPlugins(ownerId, { runtime: 'host' });
 }
 
@@ -591,6 +597,9 @@ export function buildVolumeMounts(
         'buildVolumeMounts: materializeUserRuntime failed; container will see no plugins',
       );
     }
+    // Mirror prepareHostPlugins: drop a stale empty command index that may
+    // have been cached before this runtime tree existed (plugin-command-index.ts:235).
+    invalidateUserCommandIndex(ownerId);
     mounts.push({
       hostPath: runtimeRoot,
       containerPath: CONTAINER_PLUGINS_PATH,
