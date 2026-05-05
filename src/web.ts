@@ -550,7 +550,13 @@ async function handleWebUserMessage(
       // re-expand from the ORIGINAL DB content, so inline `!` runs again.
       // Rare but possible — flagged so we can quantify in production.
       logger.warn(
-        { chatJid, messageId },
+        {
+          event: 'plugin_expander_race',
+          subtype: 'user_message',
+          chatJid,
+          userId,
+          messageId,
+        },
         'Race: eager-expanded but runner exited before sendMessage; cold-start will re-expand (inline may run twice)',
       );
     }
@@ -807,7 +813,15 @@ async function handleAgentConversationMessage(
       // Cold-start re-expands from the original DB row → inline `!` may
       // run twice. Lead-approved edge case; logged for telemetry.
       logger.warn(
-        { chatJid, virtualChatJid, agentId, messageId },
+        {
+          event: 'plugin_expander_race',
+          subtype: 'agent_conversation',
+          chatJid,
+          virtualChatJid,
+          userId,
+          agentId,
+          messageId,
+        },
         'Race: eager-expanded agent conv but runner exited before sendMessage; cold-start will re-expand',
       );
     }
