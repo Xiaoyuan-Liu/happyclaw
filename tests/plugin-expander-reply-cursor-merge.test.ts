@@ -1,7 +1,8 @@
 /**
- * plugin-expander-round17-bugs.test.ts
+ * plugin-expander-reply-cursor-merge.test.ts
  *
- * Regression tests for codex review round-17 PR2.b bugs (#27):
+ * Regression tests for the reply-cursor merge bug class (round-17 review).
+ * Covers:
  *
  *   P1-1: src/index.ts processGroupMessages early-return path
  *         When `expandMessagesIfNeeded` converts the entire batch to

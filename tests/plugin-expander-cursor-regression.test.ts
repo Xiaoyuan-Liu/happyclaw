@@ -1,7 +1,8 @@
 /**
- * plugin-expander-round11-bugs.test.ts
+ * plugin-expander-cursor-regression.test.ts
  *
- * Regression tests for codex review round-11 PR2.b bugs (#20):
+ * Regression tests for the cursor-handling and adjacent bug class
+ * (round-11 review). Covers:
  *
  *   P1-1: sendPluginExpanderReply must fan out to IM when the source chat is
  *         an IM channel — without IM delivery, /codex:status conflicts /

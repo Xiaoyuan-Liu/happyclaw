@@ -1,7 +1,8 @@
 /**
- * plugin-expander-round15-bugs.test.ts
+ * plugin-expander-mixed-admin-batch.test.ts
  *
- * Regression tests for codex review round-15 PR2.b bugs (#23):
+ * Regression tests for mixed-admin batch expansion on web:main
+ * (round-15 review). Covers:
  *
  *   P1-1: src/web.ts handleWebUserMessage / handleAgentConversationMessage
  *         eager-expand fast-path runs `expandPluginSlashCommandIfNeeded`

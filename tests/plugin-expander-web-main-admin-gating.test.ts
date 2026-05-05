@@ -1,7 +1,8 @@
 /**
- * plugin-expander-round16-bugs.test.ts
+ * plugin-expander-web-main-admin-gating.test.ts
  *
- * Regression tests for codex review round-16 PR2.b bugs (#24):
+ * Regression tests for the web:main + isHome admin-gating bug class
+ * (round-16 review). Covers:
  *
  *   P2-1: web eager-expand path used `resolvePluginRuntimeOwner` (no admin
  *         gating) while the cold-start path used `resolvePerMessageRuntimeOwner`

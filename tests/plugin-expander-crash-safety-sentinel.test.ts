@@ -1,7 +1,8 @@
 /**
- * plugin-expander-round14-bugs.test.ts
+ * plugin-expander-crash-safety-sentinel.test.ts
  *
- * Regression tests for codex review round-14 PR2.b bugs (#22):
+ * Regression tests for crash-safety sentinel handling (round-14 review).
+ * Covers:
  *
  *   P1-1: inline `!` is non-idempotent (git commit / file write / API call).
  *         Before this fix, the messages table only persisted the original

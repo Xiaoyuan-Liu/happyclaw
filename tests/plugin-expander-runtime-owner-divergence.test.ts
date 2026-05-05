@@ -1,7 +1,8 @@
 /**
- * plugin-expander-round13-bugs.test.ts
+ * plugin-expander-runtime-owner-divergence.test.ts
  *
- * Regression tests for codex review round-13 PR2.b bugs (#21):
+ * Regression tests for runtime-owner divergence between hot and cold paths
+ * (round-13 review). Covers:
  *
  *   P1-1: GroupQueue.hasActiveMainRunnerForMessage() must be a strict
  *         pre-image of `sendMessage()`'s 'sent' acceptance set. When the
