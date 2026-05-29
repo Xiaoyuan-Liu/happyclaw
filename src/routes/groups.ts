@@ -56,6 +56,7 @@ import {
   deleteAgent,
   deleteImContextBindingsByWorkspace,
 } from '../db.js';
+import { releaseOwner, persistGroupUpdate } from '../group-owner.js';
 import { logger } from '../logger.js';
 import {
   getContainerEnvConfig,
@@ -819,21 +820,13 @@ groupRoutes.post('/:jid/reset-owner', authMiddleware, async (c) => {
   const existing = getRegisteredGroup(jid);
   if (!existing) return c.json({ error: 'Group not found' }, 404);
 
-  // Mirror handleReleaseOwnerCommand: clear the owner anchor + allowlist, and
-  // downgrade owner_mentioned → when_mentioned (otherwise isGroupOwnerMessage
-  // returns false for everyone once owner_im_id is gone and the bot goes silent
-  // group-wide).
-  const updated: RegisteredGroup = {
-    ...existing,
-    owner_im_id: undefined,
-    sender_allowlist: undefined,
-    activation_mode:
-      existing.activation_mode === 'owner_mentioned'
-        ? 'when_mentioned'
-        : existing.activation_mode,
-  };
-  setRegisteredGroup(jid, updated);
-  deps.getRegisteredGroups()[jid] = updated;
+  // Same transition as /release_owner — clearing the owner anchor + allowlist
+  // and downgrading owner_mentioned → when_mentioned is the shared invariant
+  // (see group-owner.ts): without the downgrade isGroupOwnerMessage returns
+  // false for everyone once owner_im_id is gone and the bot goes silent
+  // group-wide.
+  const updated = releaseOwner(existing);
+  persistGroupUpdate(jid, updated, deps.getRegisteredGroups());
   logger.info(
     { jid, adminId: authUser.id },
     'Workspace owner force-reset by admin (/reset-owner)',

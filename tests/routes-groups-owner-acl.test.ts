@@ -74,13 +74,19 @@ function asUser(userId: string, role: 'admin' | 'member' = 'member'): void {
   process.env.HAPPYCLAW_TEST_USER_ROLE = role;
 }
 
+// Persistent stub cache (see setWebDeps below) — stable across getRegisteredGroups() calls.
+const webDepsCache: Record<string, unknown> = {};
+
 beforeAll(() => {
   fs.mkdirSync(path.join(tmpDataDir, 'db'), { recursive: true });
   fs.mkdirSync(path.join(tmpDataDir, 'groups'), { recursive: true });
   db.initDatabase();
   // Routes guard on getWebDeps(); they only touch getRegisteredGroups().
+  // Back the stub with a single persistent object (not a fresh {} per call) so
+  // reset-owner's persistGroupUpdate cache-sync writes to a stable map, matching
+  // production's `() => registeredGroups` and keeping cache state assertable.
   webContext.setWebDeps({
-    getRegisteredGroups: () => ({}),
+    getRegisteredGroups: () => webDepsCache,
   } as unknown as Parameters<typeof webContext.setWebDeps>[0]);
 });
 

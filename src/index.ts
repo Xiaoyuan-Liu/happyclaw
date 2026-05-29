@@ -215,6 +215,13 @@ import {
 import { verifyPairingCode } from './telegram-pairing.js';
 import { sdkQuery } from './sdk-query.js';
 import { executeSessionReset } from './commands.js';
+import {
+  claimOwner,
+  releaseOwner,
+  addToAllowlist,
+  removeFromAllowlist,
+  persistGroupUpdate,
+} from './group-owner.js';
 import { buildRecentConversationHistoryContext } from './conversation-history.js';
 import { scanHostMarketplaces } from './plugin-importer.js';
 import { expandMessagesIfNeeded } from './plugin-expander-core.js';
@@ -1306,9 +1313,8 @@ async function handleCommand(
     senderImId &&
     isDirectMessageJid(chatJid)
   ) {
-    const claimed: RegisteredGroup = { ...group, owner_im_id: senderImId };
-    setRegisteredGroup(chatJid, claimed);
-    registeredGroups[chatJid] = claimed;
+    const claimed = claimOwner(group, senderImId);
+    persistGroupUpdate(chatJid, claimed, registeredGroups);
     group = claimed;
     logger.info(
       { chatJid, senderImId },
@@ -1728,13 +1734,11 @@ function handleRequireMentionCommand(chatJid: string, rawArgs: string, senderImI
         require_mention: true,
         activation_mode: 'when_mentioned',
       };
-      setRegisteredGroup(chatJid, updated);
-      registeredGroups[chatJid] = updated;
+      persistGroupUpdate(chatJid, updated, registeredGroups);
       return '已从「仅 owner 响应」切换为「需要 @机器人」模式，所有人 @机器人 均可触发';
     }
     const updated: RegisteredGroup = { ...group, require_mention: true };
-    setRegisteredGroup(chatJid, updated);
-    registeredGroups[chatJid] = updated;
+    persistGroupUpdate(chatJid, updated, registeredGroups);
     return '已开启：群聊中需要 @机器人 才会响应';
   } else if (action === 'false') {
     // 关闭 require_mention 时退出 owner_mentioned 模式，但保留 owner_im_id：
@@ -1745,8 +1749,7 @@ function handleRequireMentionCommand(chatJid: string, rawArgs: string, senderImI
       require_mention: false,
       activation_mode: 'always',
     };
-    setRegisteredGroup(chatJid, updated);
-    registeredGroups[chatJid] = updated;
+    persistGroupUpdate(chatJid, updated, registeredGroups);
     return '已关闭：群聊中所有消息都会响应，无需 @机器人';
   } else if (!action) {
     const current = group.require_mention === true;
@@ -1780,12 +1783,8 @@ function handleOwnerMentionCommand(chatJid: string, senderImId?: string): string
 
   // 仅认领 owner，不强制切换 activation_mode：用户当前的群组激活策略（auto /
   // always / when_mentioned）保持不变，避免 bootstrap 时被意外改成「仅 owner 响应」。
-  const updated: RegisteredGroup = {
-    ...group,
-    owner_im_id: senderImId,
-  };
-  setRegisteredGroup(chatJid, updated);
-  registeredGroups[chatJid] = updated;
+  const updated = claimOwner(group, senderImId);
+  persistGroupUpdate(chatJid, updated, registeredGroups);
 
   logger.info(
     { chatJid, senderImId, activationMode: updated.activation_mode },
@@ -1805,17 +1804,8 @@ function handleOwnerMentionCommand(chatJid: string, senderImId?: string): string
 function handleReleaseOwnerCommand(chatJid: string): string {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) return '未找到当前工作区';
-  const updated: RegisteredGroup = {
-    ...group,
-    owner_im_id: undefined,
-    sender_allowlist: undefined,
-    activation_mode:
-      group.activation_mode === 'owner_mentioned'
-        ? 'when_mentioned'
-        : group.activation_mode,
-  };
-  setRegisteredGroup(chatJid, updated);
-  registeredGroups[chatJid] = updated;
+  const updated = releaseOwner(group);
+  persistGroupUpdate(chatJid, updated, registeredGroups);
   logger.info({ chatJid }, 'Owner released via /release_owner');
   return '✅ 已释放 owner 身份。白名单已清空，激活策略已调整为 when_mentioned（如原本是 owner-only）。下一位用户可发送 /owner_mention 重新认领。';
 }
@@ -1838,9 +1828,8 @@ function handleAllowCommand(
   if (!group.owner_im_id && group.created_by) {
     const userOwnerOpenId = getUserFeishuConfig(group.created_by)?.ownerOpenId;
     if (userOwnerOpenId && userOwnerOpenId === senderImId) {
-      const updated: RegisteredGroup = { ...group, owner_im_id: senderImId };
-      setRegisteredGroup(chatJid, updated);
-      registeredGroups[chatJid] = updated;
+      const updated = claimOwner(group, senderImId);
+      persistGroupUpdate(chatJid, updated, registeredGroups);
       group = updated;
       logger.info(
         { chatJid, senderImId },
@@ -1864,21 +1853,14 @@ function handleAllowCommand(
     return '请 @提及 要加入白名单的群成员：/allow @成员';
   }
 
-  const current = group.sender_allowlist ?? [senderImId];
-  const newIds = toAdd.filter((id) => !current.includes(id));
-  if (newIds.length === 0) {
+  const { group: updated, added } = addToAllowlist(group, senderImId, toAdd);
+  if (added.length === 0) {
     return '这些成员已在白名单中';
   }
+  persistGroupUpdate(chatJid, updated, registeredGroups);
+  logger.info({ chatJid, senderImId, added }, 'Members added to sender allowlist');
 
-  const updated: RegisteredGroup = {
-    ...group,
-    sender_allowlist: [...current, ...newIds],
-  };
-  setRegisteredGroup(chatJid, updated);
-  registeredGroups[chatJid] = updated;
-  logger.info({ chatJid, senderImId, added: newIds }, 'Members added to sender allowlist');
-
-  return `已将 ${newIds.length} 名成员加入白名单（当前共 ${updated.sender_allowlist!.length} 人）`;
+  return `已将 ${added.length} 名成员加入白名单（当前共 ${updated.sender_allowlist!.length} 人）`;
 }
 
 /**
@@ -1912,14 +1894,16 @@ function handleDisallowCommand(
     return 'Owner 不能将自己移出白名单';
   }
 
-  const updated_list = group.sender_allowlist.filter((id) => !toRemove.includes(id));
-  const updated: RegisteredGroup = { ...group, sender_allowlist: updated_list };
-  setRegisteredGroup(chatJid, updated);
-  registeredGroups[chatJid] = updated;
+  const { group: updated, removed } = removeFromAllowlist(group, toRemove);
+  if (removed === 0) {
+    // Nothing matched — skip the no-op persist (mirrors handleAllowCommand's
+    // early return when added.length === 0; avoids a redundant full-row write).
+    return `这些成员不在白名单中（当前共 ${group.sender_allowlist!.length} 人）`;
+  }
+  persistGroupUpdate(chatJid, updated, registeredGroups);
   logger.info({ chatJid, senderImId, removed: toRemove }, 'Members removed from sender allowlist');
 
-  const removedCount = group.sender_allowlist.length - updated_list.length;
-  return `已将 ${removedCount} 名成员从白名单移除（当前共 ${updated_list.length} 人）`;
+  return `已将 ${removed} 名成员从白名单移除（当前共 ${updated.sender_allowlist!.length} 人）`;
 }
 
 /**
