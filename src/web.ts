@@ -2344,6 +2344,34 @@ let statusInterval: ReturnType<typeof setInterval> | null = null;
 let httpServer: ReturnType<typeof serve> | null = null;
 let wss: WebSocketServer | null = null;
 
+/**
+ * Test-only factory: wires the given `WebDeps` into module + route state and
+ * returns the fully-configured Hono `app` (every route is already mounted at
+ * module load) so integration tests can exercise HTTP routes via
+ * `app.request(...)` — most notably `POST /api/messages` and its `/clear`
+ * interception — without starting the HTTP server, WebSocket server, container
+ * exit callbacks, or the status-broadcast interval.
+ *
+ * Mirrors the dependency wiring in {@link startWebServer} minus all the
+ * runtime side effects. NOT for production use.
+ *
+ * The supplied `webDeps` must be complete for the routes a test actually
+ * drives — this only re-binds deps, it does not validate them, so a route that
+ * reaches a `WebDeps` field the stub omits throws at request time (not at
+ * construction). The current caller stays within the `/clear` ACL path, which
+ * needs only `queue.stopGroup` / `getSessions` / `setLastAgentTimestamp`.
+ */
+export function createAppForTest(webDeps: WebDeps): typeof app {
+  deps = webDeps;
+  setWebDeps(webDeps);
+  injectConfigDeps(webDeps);
+  injectMonitorDeps({
+    broadcastDockerBuildLog,
+    broadcastDockerBuildComplete,
+  });
+  return app;
+}
+
 export function startWebServer(webDeps: WebDeps): void {
   deps = webDeps;
   setWebDeps(webDeps);
