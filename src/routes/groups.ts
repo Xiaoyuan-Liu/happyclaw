@@ -904,6 +904,18 @@ groupRoutes.post('/:jid/stop', authMiddleware, async (c) => {
   if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
     return c.json({ error: 'Group not found' }, 404);
   }
+  // Resource-level ACL: the owner (canModifyGroup) can always stop; a shared
+  // member may stop only a run they started themselves (the queue's current-run
+  // initiator), not the owner's. Mirrors the delete-message owner-or-sender model.
+  if (
+    !canModifyGroup({ id: authUser.id, role: authUser.role }, { ...group, jid }) &&
+    deps.queue.getActiveRunInitiator(jid) !== authUser.id
+  ) {
+    return c.json(
+      { error: 'Only the workspace owner or the run initiator can stop it' },
+      403,
+    );
+  }
 
   try {
     await deps.queue.stopGroup(jid);
@@ -929,6 +941,24 @@ groupRoutes.post('/:jid/interrupt', authMiddleware, async (c) => {
   const authUser = c.get('user') as AuthUser;
   if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
     return c.json({ error: 'Group not found' }, 404);
+  }
+  // Resource-level ACL (see /stop): owner OR the run's initiator. Uses the full
+  // (possibly virtual #agent:) jid so an agent-conversation run resolves to its
+  // own runner. Agent/task runs carry no message initiator (getActiveRunInitiator
+  // excludes activeRunnerIsTask) → owner-only. Known safe-direction limitation:
+  // a member who started their own agent/task run can't interrupt it — only the
+  // owner can; revisit if member-initiated agent interrupt is wanted (see PR notes).
+  if (
+    !canModifyGroup(
+      { id: authUser.id, role: authUser.role },
+      { ...group, jid: baseJid },
+    ) &&
+    deps.queue.getActiveRunInitiator(jid) !== authUser.id
+  ) {
+    return c.json(
+      { error: 'Only the workspace owner or the run initiator can interrupt it' },
+      403,
+    );
   }
 
   const interrupted = deps.queue.interruptQuery(jid);

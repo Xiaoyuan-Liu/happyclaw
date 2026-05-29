@@ -603,7 +603,10 @@ async function handleWebUserMessage(
         'Race: eager-expanded but runner exited before sendMessage; cold-start will re-expand (inline may run twice)',
       );
     }
-    deps.queue.enqueueMessageCheck(chatJid);
+    // Pass the sender as the run initiator so the stop/interrupt routes can do
+    // a resource-level "owner OR initiator" check — a shared member can stop /
+    // interrupt the run they started, but not the owner's.
+    deps.queue.enqueueMessageCheck(chatJid, userId);
   }
 
   // Only advance per-group cursor when we piped directly into a running container.
