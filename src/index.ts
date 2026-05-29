@@ -115,6 +115,9 @@ import {
   formatSystemStatus,
   resolveBoundChatTarget,
   resolveLocationInfo,
+  checkImOwnerCommand,
+  isDirectMessageJid,
+  OWNER_REQUIRED_IM_COMMANDS,
   type WorkspaceInfo,
 } from './im-command-utils.js';
 import {
@@ -1284,6 +1287,40 @@ async function handleCommand(
   const cmd = parts[0].toLowerCase();
   const rawArgs = command.slice(parts[0].length).trim();
 
+  // Owner gate for destructive IM commands. See OWNER_REQUIRED_IM_COMMANDS
+  // doc in im-command-utils.ts for the exclusion rationale (notably
+  // /owner_mention stays open as the bootstrap path for unowned groups).
+  let group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+
+  // DM auto-claim: in a 1:1 IM chat the sender is unambiguously the owner, so
+  // claim them on the first owner-required command instead of forcing a
+  // separate /owner_mention (pure friction for a single-person DM). Group
+  // chats never auto-claim — isDirectMessageJid returns false for them, so the
+  // first commander can't silently grab ownership. Feishu already auto-sets
+  // owner_im_id via its DM owner-learn path, so this only kicks in for the
+  // non-Feishu channels that buildOnNewChat leaves unowned.
+  if (
+    OWNER_REQUIRED_IM_COMMANDS.has(cmd) &&
+    group &&
+    !group.owner_im_id &&
+    senderImId &&
+    isDirectMessageJid(chatJid)
+  ) {
+    const claimed: RegisteredGroup = { ...group, owner_im_id: senderImId };
+    setRegisteredGroup(chatJid, claimed);
+    registeredGroups[chatJid] = claimed;
+    group = claimed;
+    logger.info(
+      { chatJid, senderImId },
+      'Auto-claimed DM owner on first owner-required command',
+    );
+  }
+
+  const ownerCheck = checkImOwnerCommand(cmd, group, senderImId);
+  if (!ownerCheck.ok) {
+    return `⚠️ ${ownerCheck.reason}`;
+  }
+
   switch (cmd) {
     case 'clear':
       return handleClearCommand(chatJid);
@@ -1307,6 +1344,8 @@ async function handleCommand(
       return handleRequireMentionCommand(chatJid, rawArgs, senderImId);
     case 'owner_mention':
       return handleOwnerMentionCommand(chatJid, senderImId);
+    case 'release_owner':
+      return handleReleaseOwnerCommand(chatJid);
     case 'sw':
     case 'spawn':
       return handleSpawnCommand(chatJid, rawArgs, chatJid);
@@ -1669,22 +1708,25 @@ function handleRequireMentionCommand(chatJid: string, rawArgs: string, senderImI
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) return '未找到当前会话';
 
-  // owner_mentioned 模式下，只有 owner 可以修改激活模式
-  if (group.activation_mode === 'owner_mentioned' && group.owner_im_id) {
+  // owner_im_id 已存在时，无论 activation_mode 是什么，非 owner 都不能改 activation_mode：
+  // 否则任意成员可以 /require_mention false 把群从 auto/when_mentioned/owner_mentioned 翻成
+  // always，相当于聊天提权。owner_im_id 未设置时仍放行（bootstrap path）。
+  if (group.owner_im_id) {
     if (!senderImId || senderImId !== group.owner_im_id) {
-      return '当前为「仅 owner 响应」模式，只有 owner 可以修改此设置';
+      return '⚠️ 只有工作区 owner 才能修改此设置';
     }
   }
 
   const action = rawArgs.trim().toLowerCase();
   if (action === 'true') {
-    // 如果当前是 owner_mentioned 模式，切换为 when_mentioned 并清除 owner
+    // 如果当前是 owner_mentioned 模式，切换为 when_mentioned 但保留 owner
+    // 注意：不清空 owner_im_id —— owner 是工作区认领标识，非 owner 通过
+    // 切换 activation_mode 不应该获得清掉 owner、再 /owner_mention 自我夺权的能力。
     if (group.activation_mode === 'owner_mentioned') {
       const updated: RegisteredGroup = {
         ...group,
         require_mention: true,
         activation_mode: 'when_mentioned',
-        owner_im_id: undefined,
       };
       setRegisteredGroup(chatJid, updated);
       registeredGroups[chatJid] = updated;
@@ -1695,12 +1737,13 @@ function handleRequireMentionCommand(chatJid: string, rawArgs: string, senderImI
     registeredGroups[chatJid] = updated;
     return '已开启：群聊中需要 @机器人 才会响应';
   } else if (action === 'false') {
+    // 关闭 require_mention 时退出 owner_mentioned 模式，但保留 owner_im_id：
+    // owner 身份是工作区的安全锚点（owner-required 命令依据它鉴权），不能因为
+    // 切换激活策略就被任意人通过 /require_mention false 重置。
     const updated: RegisteredGroup = {
       ...group,
       require_mention: false,
-      // 同时清除 owner_mentioned 模式，恢复为全量响应
       activation_mode: 'always',
-      owner_im_id: undefined,
     };
     setRegisteredGroup(chatJid, updated);
     registeredGroups[chatJid] = updated;
@@ -1713,9 +1756,11 @@ function handleRequireMentionCommand(chatJid: string, rawArgs: string, senderImI
 }
 
 /**
- * /owner_mention 命令：将当前发送者设为群组 owner（用于 owner_mentioned 模式）。
- * 执行后该群组只响应此发送者的 @mention，其他人的 @mention 被静默忽略。
- * 如果已有 owner，只有当前 owner 可以重新设置。
+ * /owner_mention 命令：将当前发送者认领为群组 owner（owner-only 命令的鉴权锚点）。
+ * 仅写入 owner_im_id，不修改 activation_mode —— 群组的激活策略（auto / always /
+ * when_mentioned / owner_mentioned）保持不变。
+ * 已有 owner 时（任意 activation_mode），只有当前 owner 本人可幂等地重发，
+ * 其他人会被拒绝以防夺权。
  */
 function handleOwnerMentionCommand(chatJid: string, senderImId?: string): string {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
@@ -1725,27 +1770,55 @@ function handleOwnerMentionCommand(chatJid: string, senderImId?: string): string
     return '无法识别发送者身份，请在飞书或钉钉群聊中使用此命令';
   }
 
-  // 已有 owner 时，只有 owner 本人可以重新设置
-  if (group.activation_mode === 'owner_mentioned' && group.owner_im_id && group.owner_im_id !== senderImId) {
-    return '当前群组已有 owner，只有 owner 本人可以重新设置';
+  // 已有 owner 时，任意 activation_mode 下都拒绝非 owner 的认领，避免任意人通过
+  // /owner_mention 覆盖已存在的 owner_im_id（哪怕群组当前是 'auto' / 'always' /
+  // 'when_mentioned' 模式，owner_im_id 也可能由 /allow 回填或别处设置过）。
+  // 当前 sender 就是 owner 本人时允许，保持幂等。
+  if (group.owner_im_id && group.owner_im_id !== senderImId) {
+    return '⚠️ 该群组已有 owner，无法重新认领';
   }
 
+  // 仅认领 owner，不强制切换 activation_mode：用户当前的群组激活策略（auto /
+  // always / when_mentioned）保持不变，避免 bootstrap 时被意外改成「仅 owner 响应」。
   const updated: RegisteredGroup = {
     ...group,
-    activation_mode: 'owner_mentioned',
     owner_im_id: senderImId,
   };
   setRegisteredGroup(chatJid, updated);
   registeredGroups[chatJid] = updated;
 
   logger.info(
-    { chatJid, senderImId },
-    'Owner mention mode enabled via /owner_mention command',
+    { chatJid, senderImId, activationMode: updated.activation_mode },
+    'Owner claimed via /owner_mention command',
   );
 
-  return `已开启「仅我响应」模式\n\n你的 IM 标识: ${senderImId}\n只有你 @机器人 时才会响应，其他人的 @mention 将被静默忽略。\n\n发送 /require_mention false 可恢复为全量响应。`;
+  return `已认领工作区 owner\n\n你的 IM 标识: ${senderImId}\n后续 /clear、/bind、/spawn 等 owner-only 命令将以你为准。\n群组激活策略保持不变（当前: ${updated.activation_mode ?? 'auto'}）。`;
 }
 
+/**
+ * /release_owner 命令：当前 owner 主动释放 owner 身份（reclaim path）。
+ * `checkImOwnerCommand` 已在 handleCommand 顶部确保 sender === owner_im_id。
+ * 同时清空 sender_allowlist（避免新 owner 被旧 owner 的白名单锁死、/allow 也
+ * 无法自救），并把 owner_mentioned 模式降级为 when_mentioned（否则清掉 owner
+ * 后 isGroupOwnerMessage 永远返回 false，bot 会在群里全员沉默）。
+ */
+function handleReleaseOwnerCommand(chatJid: string): string {
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return '未找到当前工作区';
+  const updated: RegisteredGroup = {
+    ...group,
+    owner_im_id: undefined,
+    sender_allowlist: undefined,
+    activation_mode:
+      group.activation_mode === 'owner_mentioned'
+        ? 'when_mentioned'
+        : group.activation_mode,
+  };
+  setRegisteredGroup(chatJid, updated);
+  registeredGroups[chatJid] = updated;
+  logger.info({ chatJid }, 'Owner released via /release_owner');
+  return '✅ 已释放 owner 身份。白名单已清空，激活策略已调整为 when_mentioned（如原本是 owner-only）。下一位用户可发送 /owner_mention 重新认领。';
+}
 
 /**
  * /allow @成员 命令：将 @提及的成员加入发言者白名单（仅 owner 可操作）。
@@ -7852,20 +7925,34 @@ function buildFeishuBotAddedHandler(
     const isNew = !registeredGroups[chatJid] && !getRegisteredGroup(chatJid);
     onNewChat(chatJid, chatName);
     if (isNew) {
-      const ownerKnown = !!getOwnerOpenId?.();
-      const welcome =
-        `已加入「${chatName}」。\n\n` +
-        `当前群聊已启用发言者白名单，仅 bot owner 可触发我。\n` +
-        (ownerKnown
-          ? `Owner 已自动从私聊中识别。\n`
-          : `请先向机器人发一条私信，系统将自动识别您的 owner 身份。\n`) +
-        `\n/allow @成员 — 将群成员加入白名单\n` +
-        `/disallow @成员 — 从白名单移除成员\n` +
-        `/allowlist — 查看白名单`;
+      // 文案分支:仅在飞书路径(传入 getOwnerOpenId,DM 可学到 ownerOpenId 并启用 allowlist)
+      // 才提示「已启用发言者白名单」+「私信识别 owner」。通用路径(dingtalk/discord/whatsapp
+      // 不传 getOwnerOpenId)实际未启用白名单,DM 也没有 learnFeishuOwner 通道,引导用
+      // /owner_mention 在群内自我认领。
+      let welcome: string;
+      if (getOwnerOpenId) {
+        const ownerKnown = !!getOwnerOpenId();
+        welcome =
+          `已加入「${chatName}」。\n\n` +
+          `当前群聊已启用发言者白名单,仅 bot owner 可触发我。\n` +
+          (ownerKnown
+            ? `Owner 已自动从私聊中识别。\n`
+            : `请先向机器人发一条私信,系统将自动识别您的 owner 身份。\n`) +
+          `\n/allow @成员 — 将群成员加入白名单\n` +
+          `/disallow @成员 — 从白名单移除成员\n` +
+          `/allowlist — 查看白名单`;
+      } else {
+        welcome =
+          `已加入「${chatName}」。\n\n` +
+          `机器人已加入群组。请由 owner 在群内发送 /owner_mention 自我认领,命令将永久绑定该身份。\n\n` +
+          `/owner_mention — 认领工作区 owner\n` +
+          `/list — 查看所有工作区\n` +
+          `/new <名称> — 新建工作区并绑定此群`;
+      }
       imManager
         .sendMessage(chatJid, welcome)
         .catch((err) =>
-          logger.warn({ chatJid, err }, 'Failed to send Feishu group welcome message'),
+          logger.warn({ chatJid, err }, 'Failed to send group welcome message'),
         );
     }
   };
@@ -8329,13 +8416,23 @@ async function connectUserIMChannels(
   const onFeishuP2pSender = (senderOpenId: string) =>
     learnFeishuOwner(userId, senderOpenId, feishuOwnerRef);
 
-  const onNewChat = buildOnNewChat(userId, homeFolder, getFeishuOwnerOpenId);
+  // Feishu-specific closure: writes the Feishu open_id into owner_im_id when
+  // registering new chats. The non-Feishu variant omits getOwnerOpenId so that
+  // telegram / qq / wechat / dingtalk / discord / whatsapp groups don't get
+  // contaminated with a Feishu open_id that will never match their senders.
+  const feishuOnNewChat = buildOnNewChat(userId, homeFolder, getFeishuOwnerOpenId);
+  const onNewChat = buildOnNewChat(userId, homeFolder);
   const resolveGroupFolder = (chatJid: string): string | undefined => {
     return resolveEffectiveFolder(chatJid);
   };
   const resolveEffectiveChatJid = buildResolveEffectiveChatJid();
   const onAgentMessage = buildOnAgentMessage();
-  const onBotAddedToGroup = buildFeishuBotAddedHandler(userId, homeFolder, getFeishuOwnerOpenId);
+  // Feishu-specific: writes Feishu open_id as owner_im_id + locks allowlist.
+  // Non-Feishu variant omits getOwnerOpenId so dingtalk/discord/whatsapp groups
+  // don't get a Feishu open_id baked in as their owner (which would never match
+  // their own senderImId namespaces).
+  const feishuOnBotAddedToGroup = buildFeishuBotAddedHandler(userId, homeFolder, getFeishuOwnerOpenId);
+  const onBotAddedToGroup = buildFeishuBotAddedHandler(userId, homeFolder);
   const onBotRemovedFromGroup = buildOnBotRemovedFromGroup();
 
   // 各渠道互相独立，并发连接避免启动时延 N×M 累加
@@ -8344,13 +8441,13 @@ async function connectUserIMChannels(
     feishuConfig.enabled !== false &&
     feishuConfig.appId &&
     feishuConfig.appSecret
-      ? imManager.connectUserFeishu(userId, feishuConfig, onNewChat, {
+      ? imManager.connectUserFeishu(userId, feishuConfig, feishuOnNewChat, {
           ignoreMessagesBefore,
           onCommand: handleCommand,
           resolveGroupFolder,
           resolveEffectiveChatJid,
           onAgentMessage,
-          onBotAddedToGroup,
+          onBotAddedToGroup: feishuOnBotAddedToGroup,
           onBotRemovedFromGroup,
           shouldProcessGroupMessage,
           isGroupOwnerMessage,

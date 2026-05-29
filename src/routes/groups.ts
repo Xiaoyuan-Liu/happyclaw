@@ -157,6 +157,8 @@ interface GroupPayloadItem {
   is_shared?: boolean;
   member_role?: 'owner' | 'member';
   member_count?: number;
+  can_modify?: boolean;
+  can_manage_members?: boolean;
   pinned_at?: string;
   activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled';
   conversation_source?: 'manual' | 'feishu_thread';
@@ -267,6 +269,11 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
       is_shared: isShared || undefined,
       member_role: memberInfo?.role ?? undefined,
       member_count: isShared ? memberInfo?.count : undefined,
+      can_modify: canModifyGroup(user, { ...group, jid }),
+      // owner-only, matching the member-management routes' canManageGroupMembers
+      // checks (no admin override — admin is not a workspace owner, consistent
+      // with canModifyGroup / canDeleteGroup).
+      can_manage_members: canManageGroupMembers(user, { ...group, jid }),
       pinned_at: pins[jid] || undefined,
       activation_mode: group.activation_mode ?? 'auto',
       conversation_source: group.conversation_source ?? 'manual',
@@ -628,26 +635,39 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     deps.ensureTerminalContainerStarted(jid);
   }
 
+  // Mirror buildGroupsPayload ACL shape so the frontend doesn't need to
+  // refetch /api/groups just to learn the writer can edit Skills/MCP/members.
+  // Creator is always owner of a fresh non-home web group, so both checks
+  // resolve true here; we still go through the helpers to keep one source of
+  // truth and avoid drift if the rules change later.
+  const groupWithJid = { ...group, jid };
+  const isAdmin = hasHostExecutionPermission(authUser);
+  const responseGroup: GroupPayloadItem = {
+    name: group.name,
+    folder: group.folder,
+    added_at: group.added_at,
+    kind: 'web',
+    editable: true,
+    deletable: true,
+    lastMessage: undefined,
+    lastMessageTime: now,
+    execution_mode: group.executionMode || 'container',
+    custom_cwd: isAdmin ? group.customCwd : undefined,
+    is_my_home: undefined,
+    is_shared: undefined,
+    member_role: 'owner',
+    member_count: undefined,
+    can_modify: canModifyGroup(authUser, groupWithJid),
+    can_manage_members: canManageGroupMembers(authUser, groupWithJid),
+    activation_mode: group.activation_mode ?? 'auto',
+    conversation_source: group.conversation_source ?? 'manual',
+    conversation_nav_mode: group.conversation_nav_mode ?? 'horizontal',
+  };
+
   return c.json({
     success: true,
     jid,
-    group: {
-      name: group.name,
-      folder: group.folder,
-      added_at: group.added_at,
-      execution_mode: group.executionMode || 'container',
-      custom_cwd: hasHostExecutionPermission(authUser)
-        ? group.customCwd
-        : undefined,
-      kind: 'web',
-      editable: true,
-      deletable: true,
-      lastMessage: undefined,
-      lastMessageTime: now,
-      member_role: 'owner',
-      member_count: 1,
-      is_shared: false,
-    },
+    group: responseGroup,
   });
 });
 
@@ -751,24 +771,21 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
 
   // Update registered group if name, activation_mode, or execution_mode changed
   if (name || activation_mode !== undefined || execution_mode !== undefined) {
+    // Spread `...existing` instead of rebuilding from an explicit field list.
+    // setRegisteredGroup is INSERT OR REPLACE (full-row overwrite), so every
+    // field omitted from the object gets silently nulled. The old explicit list
+    // dropped owner_im_id / sender_allowlist / conversation_source /
+    // conversation_nav_mode / binding_mode / feishu_chat_mode /
+    // feishu_group_message_type on EVERY rename — wiping the IM owner-gate's
+    // security anchor and corrupting feishu_thread workspaces. Only override
+    // what this PATCH actually changes.
     const updated: RegisteredGroup = {
+      ...existing,
       name: name || existing.name,
-      folder: existing.folder,
-      added_at: existing.added_at,
-      containerConfig: existing.containerConfig,
       executionMode:
         execution_mode !== undefined
           ? (execution_mode as ExecutionMode)
           : existing.executionMode,
-      customCwd: existing.customCwd,
-      initSourcePath: existing.initSourcePath,
-      initGitUrl: existing.initGitUrl,
-      created_by: existing.created_by,
-      is_home: existing.is_home,
-      target_agent_id: existing.target_agent_id,
-      target_main_jid: existing.target_main_jid,
-      reply_policy: existing.reply_policy,
-      require_mention: existing.require_mention,
       activation_mode:
         activation_mode !== undefined
           ? activation_mode
@@ -781,6 +798,47 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
   }
 
   return c.json({ success: true, pinned_at });
+});
+
+// POST /api/groups/:jid/reset-owner — admin break-glass for a stuck IM owner.
+// The IM owner-gate keys destructive commands on owner_im_id === sender. If the
+// recorded owner leaves the group / switches account, nobody matches and
+// /release_owner (owner-only) can't fire either, so owner-only commands lock up
+// permanently. A platform admin can force-release here; the next user reclaims
+// via /owner_mention (or DM auto-claim).
+groupRoutes.post('/:jid/reset-owner', authMiddleware, async (c) => {
+  const deps = getWebDeps();
+  if (!deps) return c.json({ error: 'Server not initialized' }, 500);
+
+  const authUser = c.get('user') as AuthUser;
+  if (authUser.role !== 'admin') {
+    return c.json({ error: 'Only an admin can reset the workspace owner' }, 403);
+  }
+
+  const jid = c.req.param('jid');
+  const existing = getRegisteredGroup(jid);
+  if (!existing) return c.json({ error: 'Group not found' }, 404);
+
+  // Mirror handleReleaseOwnerCommand: clear the owner anchor + allowlist, and
+  // downgrade owner_mentioned → when_mentioned (otherwise isGroupOwnerMessage
+  // returns false for everyone once owner_im_id is gone and the bot goes silent
+  // group-wide).
+  const updated: RegisteredGroup = {
+    ...existing,
+    owner_im_id: undefined,
+    sender_allowlist: undefined,
+    activation_mode:
+      existing.activation_mode === 'owner_mentioned'
+        ? 'when_mentioned'
+        : existing.activation_mode,
+  };
+  setRegisteredGroup(jid, updated);
+  deps.getRegisteredGroups()[jid] = updated;
+  logger.info(
+    { jid, adminId: authUser.id },
+    'Workspace owner force-reset by admin (/reset-owner)',
+  );
+  return c.json({ success: true });
 });
 
 // DELETE /api/groups/:jid - 删除群组

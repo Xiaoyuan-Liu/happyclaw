@@ -37,8 +37,15 @@ export interface TelegramConnectOpts {
     chatName: string,
     code: string,
   ) => Promise<boolean>;
-  /** 斜杠指令回调（如 /clear），返回回复文本或 null */
-  onCommand?: (chatJid: string, command: string) => Promise<string | null>;
+  /** 斜杠指令回调（如 /clear），返回回复文本或 null。
+   *  senderImId 是发送者的裸 Telegram 用户 ID（不含 `tg:` 前缀），
+   *  与飞书/钉钉 onCommand 传裸 open_id / senderId 的格式一致，
+   *  用于在主进程做 owner-only 命令检查（owner_im_id 比对）。 */
+  onCommand?: (
+    chatJid: string,
+    command: string,
+    senderImId?: string,
+  ) => Promise<string | null>;
   /** 热重连时设置：丢弃 date 早于此时间戳（epoch ms）的消息，避免处理渠道关闭期间的堆积消息 */
   ignoreMessagesBefore?: number;
   /** 根据 jid 解析群组 folder，用于下载文件/图片到工作区 */
@@ -530,7 +537,10 @@ export function createTelegramConnection(
               'Telegram slash command detected',
             );
             try {
-              const reply = await opts.onCommand(jid, cmdBody);
+              const senderImId = ctx.from?.id
+                ? String(ctx.from.id)
+                : undefined;
+              const reply = await opts.onCommand(jid, cmdBody, senderImId);
               if (reply) {
                 await ctx.reply(reply);
                 return; // 已知命令，拦截

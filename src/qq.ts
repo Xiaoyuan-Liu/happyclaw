@@ -275,7 +275,13 @@ export interface QQConnectOpts {
     chatName: string,
     code: string,
   ) => Promise<boolean>;
-  onCommand?: (chatJid: string, command: string) => Promise<string | null>;
+  /** 斜杠指令回调。senderImId 是发送者的裸 QQ open_id（不含 `qq:` 前缀），
+   *  与飞书/钉钉 onCommand 传裸 ID 的格式一致，用于主进程 owner-only 检查。 */
+  onCommand?: (
+    chatJid: string,
+    command: string,
+    senderImId?: string,
+  ) => Promise<string | null>;
   resolveGroupFolder?: (jid: string) => string | undefined;
   resolveEffectiveChatJid?: (
     chatJid: string,
@@ -1562,7 +1568,12 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           slashMatch[1] + (slashMatch[2] ? ' ' + slashMatch[2] : '')
         ).trim();
         try {
-          const reply = await opts.onCommand(jid, cmdBody);
+          // Namespace senderImId with `c2c:` prefix so owner_im_id 比对在
+          // DM 与群聊上下文中独立——QQ Bot API v2 的 author.user_openid (C2C) 与
+          // author.member_openid (Group) 是两个不同的 ID namespace，protocol
+          // 层面不互通；前缀化让 DM 认领的 owner 与群里认领的 owner 各自落入
+          // 独立记录，互不干扰。
+          const reply = await opts.onCommand(jid, cmdBody, `c2c:${userOpenId}`);
           if (reply) {
             await sendQQMessage('c2c', userOpenId, markdownToPlainText(reply));
             return;
@@ -1736,7 +1747,13 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
           slashMatch[1] + (slashMatch[2] ? ' ' + slashMatch[2] : '')
         ).trim();
         try {
-          const reply = await opts.onCommand(jid, cmdBody);
+          // Namespace senderImId with `group:` prefix——见 C2C 分支的注释。
+          // member_openid 仅在群聊上下文有意义，与 C2C 的 user_openid 不互通。
+          const reply = await opts.onCommand(
+            jid,
+            cmdBody,
+            memberOpenId ? `group:${memberOpenId}` : undefined,
+          );
           if (reply) {
             await sendQQMessage(
               'group',

@@ -84,7 +84,11 @@ export interface WhatsAppConnectOpts {
   onReady?: () => void;
   onNewChat: (jid: string, name: string) => void;
   ignoreMessagesBefore?: number;
-  onCommand?: (chatJid: string, command: string) => Promise<string | null>;
+  onCommand?: (
+    chatJid: string,
+    command: string,
+    senderImId?: string,
+  ) => Promise<string | null>;
   resolveGroupFolder?: (jid: string) => string | undefined;
   resolveEffectiveChatJid?: (
     chatJid: string,
@@ -624,7 +628,7 @@ export function createWhatsAppConnection(
         slashMatch[1] + (slashMatch[2] ? ' ' + slashMatch[2] : '')
       ).trim();
       try {
-        const reply = await opts.onCommand(chatJid, cmdBody);
+        const reply = await opts.onCommand(chatJid, cmdBody, senderImId);
         if (reply !== null && reply !== undefined) {
           if (sock) {
             try {

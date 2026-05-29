@@ -20,6 +20,7 @@ import {
   isHostExecutionGroup,
   hasHostExecutionPermission,
   canAccessGroup,
+  canModifyGroup,
   getCachedSessionWithUser,
   invalidateSessionCache,
 } from './web-context.js';
@@ -284,10 +285,21 @@ app.post('/api/messages', authMiddleware, async (c) => {
   }
 
   // /clear: reset session without entering message pipeline.
-  // Permission: relies on the route-level canAccessGroup + host-mode checks above.
-  // Whether to tighten /clear to owner-only is left to the follow-up ACL audit
-  // (see PR description) — keeping it aligned with send-message for now.
+  // Permission: owner-only (canModifyGroup) — aligned with `reset-session`
+  // route, since /clear has the same destructive effect (clears agent
+  // session files, stops sibling containers, drops conversation history).
   if (isClearCommand(content)) {
+    if (
+      !canModifyGroup(
+        { id: authUser.id, role: authUser.role },
+        { ...group, jid: chatJid },
+      )
+    ) {
+      return c.json(
+        { error: 'Only the workspace owner can run /clear' },
+        403,
+      );
+    }
     if (!deps) return c.json({ error: 'Server not initialized' }, 500);
     try {
       await executeSessionReset(chatJid, group.folder, {
@@ -1196,11 +1208,20 @@ function setupWebSocket(server: any): WebSocketServer {
           // Must run before the agentId early return so /clear in a sub-agent tab
           // resets the agent session (passing agentId) instead of being delivered
           // to the agent as plain text.
-          // Permission: relies on the canAccessGroup + host-mode checks above
-          // (kept aligned with send-message; ACL tightening tracked in follow-up).
+          // Permission: owner-only (canModifyGroup) — aligned with HTTP /clear
+          // and `reset-session` route. /clear has the same destructive effect.
           // Success has no explicit ws_error/ack — the client sees the reset
           // through the broadcastNewMessage(context_reset) push from executeSessionReset.
           if (isClearCommand(content) && deps && targetGroup) {
+            if (
+              !canModifyGroup(
+                { id: session.user_id, role: session.role },
+                { ...targetGroup, jid: chatJid },
+              )
+            ) {
+              sendWsError('Only the workspace owner can run /clear', chatJid);
+              return;
+            }
             // Validate agentId before passing to executeSessionReset →
             // clearSessionFiles, which interpolates agentId into a filesystem
             // path. Mirrors the reset-session route's check (routes/groups.ts).
