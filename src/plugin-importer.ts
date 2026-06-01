@@ -1,9 +1,16 @@
 /**
  * plugin-importer.ts
  *
- * Scan host marketplaces (default `~/.claude/plugins/marketplaces`, override via
- * SystemSettings.externalClaudeDir) and import each plugin into the immutable
- * catalog snapshot tree.
+ * Scan host marketplaces and import each plugin into the immutable catalog
+ * snapshot tree. The set of marketplaces is the UNION of:
+ *   - physical subdirs of `<externalDir>/plugins/marketplaces/` (where Claude
+ *     Code clones github-source marketplaces), and
+ *   - every `installLocation` registered in
+ *     `<externalDir>/plugins/known_marketplaces.json` — the only place a
+ *     `directory`-source marketplace (referenced in place, never copied into
+ *     marketplaces/) is recorded.
+ * `<externalDir>` defaults to `~/.claude`, overridable via
+ * SystemSettings.externalClaudeDir.
  *
  * Properties guaranteed:
  * - **Single concurrent scan per process**: a module-level mutex serializes
@@ -96,7 +103,6 @@ export function isScanInFlight(): boolean {
 // --- Internal scan implementation --------------------------------------------
 
 async function runScan(opts: ScanOptions): Promise<ImportReport> {
-  const root = resolveScanRoot(opts);
   const report: ImportReport = {
     marketplacesScanned: 0,
     pluginsScanned: 0,
@@ -108,26 +114,15 @@ async function runScan(opts: ScanOptions): Promise<ImportReport> {
   // Ensure catalog root exists so writes don't have to mkdir each time.
   fs.mkdirSync(getCatalogRoot(), { recursive: true });
 
-  let mpEntries: string[];
-  try {
-    mpEntries = fs.readdirSync(root);
-  } catch (err) {
-    const msg = `Marketplace root not readable at ${root}: ${
-      err instanceof Error ? err.message : String(err)
-    }`;
-    logger.warn({ root, err }, 'plugin-importer: marketplace root unreadable');
-    report.warnings.push(msg);
-    return report;
-  }
+  const marketplaces = resolveMarketplaceDirs(opts, report);
 
   const idx = readCatalogIndex();
 
-  for (const mpName of mpEntries) {
+  for (const { name: mpName, dir: mpDir } of marketplaces) {
     if (!isValidNameSegment(mpName)) {
       report.warnings.push(`Skipped invalid marketplace name: ${mpName}`);
       continue;
     }
-    const mpDir = path.join(root, mpName);
     let mpStat: fs.Stats;
     try {
       mpStat = fs.statSync(mpDir);
@@ -255,11 +250,139 @@ async function runScan(opts: ScanOptions): Promise<ImportReport> {
   return report;
 }
 
-function resolveScanRoot(opts: ScanOptions): string {
+/** A marketplace root directory resolved for scanning. */
+interface ResolvedMarketplace {
+  name: string;
+  /** Path to the marketplace root directory. */
+  dir: string;
+}
+
+/**
+ * Resolve the set of marketplace directories to scan, as the union of two
+ * sources (deduped by name; the known-registry entry wins on collision —
+ * github entries resolve to the same dir as the physical clone anyway):
+ *
+ *   (a) physical subdirectories of `<externalDir>/plugins/marketplaces/`, and
+ *   (b) every `installLocation` in `<externalDir>/plugins/known_marketplaces
+ *       .json`. This is the ONLY place a `directory`-source marketplace
+ *       appears: Claude Code references it in place (never copying into
+ *       marketplaces/), so a readdir of marketplaces/ alone can never discover
+ *       it. `installLocation` points at the real on-disk dir for github AND
+ *       directory sources, so it is a uniform anchor regardless of `source`
+ *       shape.
+ *
+ * Non-fatal problems (unreadable marketplaces/ root, malformed
+ * known_marketplaces.json) push a warning onto `report` so a partial host
+ * layout is visible in the scan result rather than failing silently.
+ */
+function resolveMarketplaceDirs(
+  opts: ScanOptions,
+  report: ImportReport,
+): ResolvedMarketplace[] {
+  // Legacy explicit-directory source: treat the given path as a container root
+  // whose subdirectories are marketplaces. Kept for API compatibility; no
+  // production caller currently passes this.
   if (opts.source && opts.source.type === 'directory') {
-    return opts.source.path;
+    return readMarketplacesRoot(opts.source.path, report);
   }
-  return path.join(getEffectiveExternalDir(), 'plugins', 'marketplaces');
+
+  const pluginsBase = path.join(getEffectiveExternalDir(), 'plugins');
+  const byName = new Map<string, ResolvedMarketplace>();
+
+  // (a) physical marketplaces/ subdirs (github-source clones live here).
+  for (const mp of readMarketplacesRoot(
+    path.join(pluginsBase, 'marketplaces'),
+    report,
+  )) {
+    byName.set(mp.name, mp);
+  }
+
+  // (b) known_marketplaces.json installLocation entries (directory sources
+  // only appear here). Registry wins on name collision.
+  for (const mp of readKnownMarketplaces(pluginsBase, report)) {
+    byName.set(mp.name, mp);
+  }
+
+  return [...byName.values()];
+}
+
+/**
+ * List the immediate subdirectories of a marketplaces container `root` as
+ * candidate marketplaces. Names are NOT validated here — the caller's main
+ * loop validates each `name` against `isValidNameSegment` and warns, matching
+ * the historical behaviour. An unreadable `root` (e.g. a host with no
+ * plugins/marketplaces dir) yields a warning + empty list rather than throwing.
+ */
+function readMarketplacesRoot(
+  root: string,
+  report: ImportReport,
+): ResolvedMarketplace[] {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(root);
+  } catch (err) {
+    const msg = `Marketplace root not readable at ${root}: ${
+      err instanceof Error ? err.message : String(err)
+    }`;
+    logger.warn({ root, err }, 'plugin-importer: marketplace root unreadable');
+    report.warnings.push(msg);
+    return [];
+  }
+  return entries.map((name) => ({ name, dir: path.join(root, name) }));
+}
+
+/**
+ * Read Claude Code's `<pluginsBase>/known_marketplaces.json` and return one
+ * entry per registered marketplace, anchored on its `installLocation` (the
+ * real on-disk path). Non-throwing: a missing file is normal (returns []); a
+ * malformed file warns and returns []. Names are validated by the caller.
+ */
+function readKnownMarketplaces(
+  pluginsBase: string,
+  report: ImportReport,
+): ResolvedMarketplace[] {
+  const file = path.join(pluginsBase, 'known_marketplaces.json');
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, 'utf-8');
+  } catch {
+    // No registry file (or unreadable). Normal on hosts that only have
+    // marketplaces/ clones — not worth a warning.
+    return [];
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    const msg = `known_marketplaces.json parse failed at ${file}: ${
+      err instanceof Error ? err.message : String(err)
+    }`;
+    logger.warn(
+      { file, err },
+      'plugin-importer: known_marketplaces.json parse failed',
+    );
+    report.warnings.push(msg);
+    return [];
+  }
+  // Reject arrays too (`typeof [] === 'object'`): a CC registry is always an
+  // object map. An array would otherwise fall through to Object.entries() and
+  // be iterated as bogus marketplaces named "0", "1", … (numeric keys pass
+  // isValidNameSegment).
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return [];
+
+  const out: ResolvedMarketplace[] = [];
+  for (const [name, rawEntry] of Object.entries(
+    parsed as Record<string, unknown>,
+  )) {
+    if (!rawEntry || typeof rawEntry !== 'object') continue;
+    const loc = (rawEntry as Record<string, unknown>).installLocation;
+    if (typeof loc !== 'string' || loc.length === 0) continue;
+    // installLocation is documented as absolute; resolve defensively against
+    // the plugins dir if a relative path ever slips through (CC issue #23978).
+    const dir = path.isAbsolute(loc) ? loc : path.resolve(pluginsBase, loc);
+    out.push({ name, dir });
+  }
+  return out;
 }
 
 interface ImportPluginArgs {
