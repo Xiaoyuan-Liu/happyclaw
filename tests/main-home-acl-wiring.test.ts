@@ -48,7 +48,9 @@ vi.mock('../src/logger.js', () => ({
 }));
 
 const db = await import('../src/db.js');
-const { canAccessGroup } = await import('../src/web-context.js');
+const { canAccessGroup, canModifyGroup, canDeleteGroup } = await import(
+  '../src/web-context.js'
+);
 
 beforeAll(() => {
   fs.mkdirSync(path.join(tmpDataDir, 'db'), { recursive: true });
@@ -103,6 +105,34 @@ describe('canAccessGroup wiring — web:main is active-admins-shared (#519 optio
 
   test('the home owner can always access their own home', () => {
     expect(canAccessGroup({ id: 'u2', role: 'member' }, memberHome)).toBe(true);
+  });
+});
+
+describe('canModifyGroup wiring — web:main reset/clear is active-admins-shared (#519)', () => {
+  test('a second active admin (created_by mismatch) CAN modify web:main', () => {
+    // The #519 fix: once the bootstrap admin is disabled/deleted, another active
+    // admin must still be able to /clear or reset the shared home. Regresses if
+    // the is_home branch reverts to `return group.created_by === user.id`.
+    expect(canModifyGroup({ id: 'adminB', role: 'admin' }, webMain)).toBe(true);
+  });
+
+  test('the bootstrap admin still modifies web:main', () => {
+    expect(canModifyGroup({ id: 'adminA', role: 'admin' }, webMain)).toBe(true);
+  });
+
+  test('a member CANNOT modify web:main', () => {
+    expect(canModifyGroup({ id: 'mallory', role: 'member' }, webMain)).toBe(false);
+  });
+
+  test("an admin does NOT gain modify rights on another user's home", () => {
+    expect(canModifyGroup({ id: 'adminB', role: 'admin' }, memberHome)).toBe(false);
+  });
+
+  test('the share exception opens reset/clear but NOT delete of web:main', () => {
+    // Deletion of any is_home group is blocked outright (canDeleteGroup), so the
+    // shared-modify exception must not leak into a delete capability.
+    expect(canDeleteGroup({ id: 'adminB', role: 'admin' }, webMain)).toBe(false);
+    expect(canDeleteGroup({ id: 'adminA', role: 'admin' }, webMain)).toBe(false);
   });
 });
 

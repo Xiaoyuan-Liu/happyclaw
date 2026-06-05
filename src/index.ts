@@ -187,6 +187,7 @@ import { resolveTaskOwner } from './task-utils.js';
 import {
   resolvePerMessageRuntimeOwner,
   resolveAdminSharedRuntimeOwner,
+  resolveLatestAdminSenderOverride,
 } from './runtime-owner.js';
 import { checkOwnerActive } from './owner-gate.js';
 import { isMainHome, evaluateOwnerGate } from './main-home-acl.js';
@@ -7394,23 +7395,21 @@ async function startMessageLoop(): Promise<void> {
           const lastSourceJidForRoute =
             messagesToSend[messagesToSend.length - 1]?.source_jid || chatJid;
 
-          // #519 step 4: resolve this injection batch's runtime owner so we never
-          // pipe one admin's message into another admin's already-loaded runtime
-          // on the shared web:main home. On a mismatch sendMessage() returns
-          // 'no_active' → a fresh run is enqueued whose cold-start re-resolves the
-          // owner. On every other group this equals created_by → no behaviour change.
-          // IM-sibling senders (open_id, not a HappyClaw userId) fall back to
-          // created_by, so an IM message arriving mid-run under a different active
-          // owner is safely deferred to a fresh run rather than mis-injected.
+          // #519 step 4: the owner this injection batch *requires* (null = no
+          // constraint). On the shared web:main home, only an identifiable active-
+          // admin sender constrains the inject — so admin B's message never pipes
+          // into admin A's already-loaded runtime (mismatch → sendMessage returns
+          // 'no_active' → a fresh run cold-starts under B). IM-sibling senders
+          // (open_id, not a HappyClaw userId) resolve to null, so a same-admin IM
+          // follow-up still injects into that admin's active run instead of wrongly
+          // deferring to a bootstrap-owned fresh run (#8 — must NOT fall back to
+          // created_by here). On every non-web:main group injectOwnerId is null →
+          // the guard is a no-op (created_by == the run's owner there anyway).
           const { effectiveGroup: injEffectiveGroup } =
             resolveEffectiveGroup(group);
-          const injectOwnerId = resolveAdminSharedRuntimeOwner({
-            chatJid,
-            isHome: !!injEffectiveGroup.is_home,
-            fallbackOwner: injEffectiveGroup.created_by,
-            messages: messagesToSend,
-            getUserById,
-          });
+          const injectOwnerId = isMainHome(injEffectiveGroup)
+            ? resolveLatestAdminSenderOverride(messagesToSend, getUserById)
+            : null;
           const sendResult = queue.sendMessage(
             chatJid,
             formatted,

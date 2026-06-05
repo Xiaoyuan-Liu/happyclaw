@@ -10,7 +10,7 @@ import type {
   UserSessionWithUser,
 } from './types.js';
 import type { RuntimeOwnerCandidateUser } from './runtime-owner.js';
-import { canAdminShareMainHome } from './main-home-acl.js';
+import { canAdminShareMainHome, isMainHome } from './main-home-acl.js';
 import {
   getJidsByFolder,
   getRegisteredGroup,
@@ -326,8 +326,13 @@ export function canAccessGroup(
 }
 
 /**
- * Check if a user can modify (rename, reset) a group.
+ * Check if a user can modify (rename, reset, /clear, manage agents/skills) a group.
  * - Users can modify their own home group.
+ * - web:main is the active-admins-shared admin home (issue #519, option B): any
+ *   active admin may reset/clear it — otherwise, once the bootstrap admin in
+ *   created_by is disabled/deleted, no remaining admin could /clear or reset the
+ *   shared home (it would be permanently un-resettable). Deletion is unaffected:
+ *   canDeleteGroup blocks every is_home group outright.
  * - Users can modify web groups they created.
  * - IM groups can be modified by their owner (created_by).
  */
@@ -335,7 +340,11 @@ export function canModifyGroup(
   user: { id: string; role: UserRole },
   group: RegisteredGroup & { jid: string },
 ): boolean {
-  if (group.is_home) return group.created_by === user.id;
+  if (group.is_home) {
+    if (group.created_by === user.id) return true;
+    if (canAdminShareMainHome(group, user)) return true;
+    return false;
+  }
   if (!group.jid.startsWith('web:')) {
     if (group.created_by) return group.created_by === user.id;
     // Legacy IM group (created_by=null): resolve owner via group_members first.
