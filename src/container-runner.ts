@@ -228,6 +228,13 @@ export interface ContainerInput {
    * plugins.json; never set by the caller.
    */
   plugins?: Array<{ type: 'local'; path: string }>;
+  /**
+   * Whose plugins / MCP servers / user-global memory this run loads. For the
+   * active-admins-shared web:main home (#519), this is the message *sender* —
+   * not group.created_by (the workspace metadata owner). Falls back to
+   * group.created_by when unset, so non-shared groups behave exactly as before.
+   */
+  runtimeOwnerId?: string | null;
   /** Runtime context audit bootstrap; agent-runner enriches it with SDK usage. */
   contextAudit?: ClaudeContextAudit;
 }
@@ -523,13 +530,25 @@ export function buildVolumeMounts(
   ownerHomeFolder?: string,
   taskRunId?: string,
   resolvedProvider?: ResolvedProvider,
+  /**
+   * Runtime owner override (#519): whose user-global memory + MCP servers to
+   * mount/load. Defaults to group.created_by when unset.
+   */
+  ownerOverride?: string | null,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
 
   // Per-user global memory directory:
-  // Each user gets their own user-global/{userId}/ mounted as /workspace/global
-  const ownerId = group.created_by;
+  // Each user gets their own user-global/{userId}/ mounted as /workspace/global.
+  // ownerOverride lets the shared web:main home (#519) mount the message
+  // sender's global memory instead of the metadata owner's.
+  // Note: user *skills* still ride group.created_by (via buildClaudeContextPlan
+  // below) rather than ownerOverride. That is correct today — the cold-start
+  // rewrite keeps created_by == the runtime owner, so they never diverge — and
+  // routing skills through the override is a follow-up for when the three-identity
+  // decoupling removes that rewrite.
+  const ownerId = ownerOverride ?? group.created_by;
   if (ownerId) {
     const userGlobalDir = path.join(GROUPS_DIR, 'user-global', ownerId);
     mkdirForContainer(userGlobalDir);
@@ -950,6 +969,7 @@ export async function runContainerAgent(
       ownerHomeFolder,
       input.taskRunId,
       resolvedProvider,
+      input.runtimeOwnerId ?? group.created_by,
     );
     const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
     const agentSuffix = input.agentId
@@ -1004,10 +1024,11 @@ export async function runContainerAgent(
       });
       // Derive a new input with docker-runtime plugins injected; never mutate
       // the caller's `input` object (queue/log/retry paths reuse the same ref).
+      const dockerRuntimeOwner = input.runtimeOwnerId ?? group.created_by;
       const dockerInput: ContainerInput = {
         ...input,
-        plugins: group.created_by
-          ? loadUserPlugins(group.created_by, { runtime: 'docker' })
+        plugins: dockerRuntimeOwner
+          ? loadUserPlugins(dockerRuntimeOwner, { runtime: 'docker' })
           : [],
         contextAudit: buildClaudeContextPlan({
           executionMode: 'container',
@@ -1429,7 +1450,8 @@ export async function runHostAgent(
   // 3. 写入 settings.json（合并模式，不覆盖已有用户配置）
   // Load user's global MCP servers (same logic as Docker mode).
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  const hostMcpServers = group.created_by ? loadUserMcpServers(group.created_by) : {};
+  const hostMcpOwner = input.runtimeOwnerId ?? group.created_by;
+  const hostMcpServers = hostMcpOwner ? loadUserMcpServers(hostMcpOwner) : {};
   ensureSettingsJson(settingsFile, hostMcpServers);
 
   // 4. Skills / Rules / CLAUDE.md 自动链接到 session 目录
@@ -1586,7 +1608,7 @@ export async function runHostAgent(
 
     if (!disableMemoryLayer) {
       // Per-user global memory（HappyClaw 自带 memory 层）
-      const ownerId = group.created_by;
+      const ownerId = input.runtimeOwnerId ?? group.created_by;
       if (ownerId) {
         const userGlobalDir = path.join(GROUPS_DIR, 'user-global', ownerId);
         fs.mkdirSync(userGlobalDir, { recursive: true });
@@ -1775,7 +1797,7 @@ export async function runHostAgent(
       // plugins.
       const hostInput: ContainerInput = {
         ...input,
-        plugins: prepareHostPlugins(group.created_by),
+        plugins: prepareHostPlugins(input.runtimeOwnerId ?? group.created_by),
         contextAudit: hostClaudeContextPlan.audit,
       };
       proc.stdin.write(JSON.stringify(hostInput));

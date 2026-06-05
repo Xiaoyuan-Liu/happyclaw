@@ -258,6 +258,49 @@ describe('buildVolumeMounts — Claude triad inheritance', () => {
   });
 });
 
+describe('buildVolumeMounts — runtime owner override (#519 step 3)', () => {
+  test('ownerOverride selects whose user-global memory mounts at /workspace/global', () => {
+    // On the active-admins-shared web:main home, a run triggered by admin B must
+    // mount B's user-global/, not the workspace metadata owner (admin A)'s — else
+    // B's memory_append writes into A's directory (the cross-admin isolation bug
+    // #519 step 3 fixes). This is the load-bearing mount selection.
+    const groupsDir = path.join(tmpDataDir, 'groups');
+    const home = { ...fakeGroup('main', 'adminA'), is_home: true };
+
+    const baseline = buildVolumeMounts(home as any, false, true);
+    expect(
+      baseline.find((m) => m.containerPath === '/workspace/global')!.hostPath,
+    ).toBe(path.join(groupsDir, 'user-global', 'adminA'));
+
+    const overridden = buildVolumeMounts(
+      home as any,
+      false, // isAdminHome
+      true, // mountUserSkills
+      undefined, // agentId
+      undefined, // ownerHomeFolder
+      undefined, // taskRunId
+      undefined, // resolvedProvider
+      'adminB', // ownerOverride (#519): the message sender's runtime owner
+    );
+    const global = overridden.find(
+      (m) => m.containerPath === '/workspace/global',
+    )!;
+    expect(global.hostPath).toBe(path.join(groupsDir, 'user-global', 'adminB'));
+    // created_by is unchanged — the override is per-run, not a metadata mutation.
+    expect(home.created_by).toBe('adminA');
+    // is_home → the mount is writable, so the override genuinely redirects writes.
+    expect(global.readonly).toBe(false);
+  });
+
+  test('ownerOverride is ignored when undefined (falls back to created_by)', () => {
+    const groupsDir = path.join(tmpDataDir, 'groups');
+    const mounts = buildVolumeMounts(fakeGroup('grp-y', 'owner1') as any, false, true);
+    expect(
+      mounts.find((m) => m.containerPath === '/workspace/global')!.hostPath,
+    ).toBe(path.join(groupsDir, 'user-global', 'owner1'));
+  });
+});
+
 describe('prepareHostPlugins — host-mode pre-spawn materialize', () => {
   test('materializes runtime/ on demand when v2 config exists but tree is missing', () => {
     // Reproduces the bug fixed in this task: v2 config is present but

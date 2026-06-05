@@ -183,7 +183,10 @@ import {
 } from './types.js';
 import { logger } from './logger.js';
 import { resolveTaskOwner } from './task-utils.js';
-import { resolvePerMessageRuntimeOwner } from './runtime-owner.js';
+import {
+  resolvePerMessageRuntimeOwner,
+  resolveAdminSharedRuntimeOwner,
+} from './runtime-owner.js';
 import { checkOwnerActive } from './owner-gate.js';
 import {
   ensureAgentDirectories,
@@ -2849,20 +2852,23 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   if (missedMessages.length === 0) return true;
 
-  // Admin home is shared as web:main, so select runtime owner from the latest
-  // active admin sender to avoid writing global memory into another admin's
-  // user-global directory.
-  if (chatJid === 'web:main' && effectiveGroup.is_home) {
-    for (let i = missedMessages.length - 1; i >= 0; i--) {
-      const sender = missedMessages[i]?.sender;
-      if (!sender || sender === 'happyclaw-agent' || sender === '__system__')
-        continue;
-      const senderUser = getUserById(sender);
-      if (senderUser?.status === 'active' && senderUser.role === 'admin') {
-        effectiveGroup = { ...effectiveGroup, created_by: senderUser.id };
-        break;
-      }
-    }
+  // Admin home is shared as web:main (#519): select the runtime owner from the
+  // latest active-admin sender so this run loads that admin's plugins/MCP and
+  // writes global memory into their own user-global directory — not whichever
+  // admin first materialised the group. resolveAdminSharedRuntimeOwner gates on
+  // web:main + is_home internally and returns created_by unchanged elsewhere.
+  const coldStartRuntimeOwner = resolveAdminSharedRuntimeOwner({
+    chatJid,
+    isHome: !!effectiveGroup.is_home,
+    fallbackOwner: effectiveGroup.created_by,
+    messages: missedMessages,
+    getUserById,
+  });
+  if (
+    coldStartRuntimeOwner &&
+    coldStartRuntimeOwner !== effectiveGroup.created_by
+  ) {
+    effectiveGroup = { ...effectiveGroup, created_by: coldStartRuntimeOwner };
   }
 
   // Direct IM chats reply to themselves. Routed IM messages keep their original
@@ -4347,6 +4353,7 @@ async function runAgent(
         groupFolder: group.folder,
         displayName: identifier,
         selectedProviderId,
+        runtimeOwnerId: group.created_by,
       });
     };
 
@@ -4369,6 +4376,7 @@ async function runAgent(
           isAdminHome,
           images,
           messageTaskId,
+          runtimeOwnerId: group.created_by,
         },
         onProcessCb,
         wrappedOnOutput,
@@ -4389,6 +4397,7 @@ async function runAgent(
           isAdminHome,
           images,
           messageTaskId,
+          runtimeOwnerId: group.created_by,
         },
         onProcessCb,
         wrappedOnOutput,
@@ -7365,6 +7374,23 @@ async function startMessageLoop(): Promise<void> {
           const lastSourceJidForRoute =
             messagesToSend[messagesToSend.length - 1]?.source_jid || chatJid;
 
+          // #519 step 4: resolve this injection batch's runtime owner so we never
+          // pipe one admin's message into another admin's already-loaded runtime
+          // on the shared web:main home. On a mismatch sendMessage() returns
+          // 'no_active' → a fresh run is enqueued whose cold-start re-resolves the
+          // owner. On every other group this equals created_by → no behaviour change.
+          // IM-sibling senders (open_id, not a HappyClaw userId) fall back to
+          // created_by, so an IM message arriving mid-run under a different active
+          // owner is safely deferred to a fresh run rather than mis-injected.
+          const { effectiveGroup: injEffectiveGroup } =
+            resolveEffectiveGroup(group);
+          const injectOwnerId = resolveAdminSharedRuntimeOwner({
+            chatJid,
+            isHome: !!injEffectiveGroup.is_home,
+            fallbackOwner: injEffectiveGroup.created_by,
+            messages: messagesToSend,
+            getUserById,
+          });
           const sendResult = queue.sendMessage(
             chatJid,
             formatted,
@@ -7374,6 +7400,7 @@ async function startMessageLoop(): Promise<void> {
               activeRouteUpdaters.get(group.folder)?.(lastSourceJidForRoute);
             },
             lastSourceJidForRoute,
+            injectOwnerId,
           );
           if (sendResult === 'sent') {
             logger.debug(
@@ -7394,7 +7421,12 @@ async function startMessageLoop(): Promise<void> {
               id: lastProcessed.id,
             });
           } else {
-            // no_active — enqueue for a new one
+            // no_active — enqueue a fresh run. Crucially, do NOT advance the pull
+            // cursor here (advanceNextPullCursorOnly is in the 'sent' branch only):
+            // on a runtime-owner mismatch (#519 step 4) the deferred batch must stay
+            // re-pullable so the fresh run's cold-start re-reads it and re-resolves
+            // the owner. Advancing the cursor here would silently drop the deferred
+            // admin's message.
             queue.enqueueMessageCheck(chatJid);
           }
         }

@@ -39,6 +39,13 @@ export interface ContainerInput {
    * host absolute path for host mode).
    */
   plugins?: Array<{ type: 'local'; path: string }>;
+  /**
+   * Whose plugins / MCP / global memory this run loads (the message sender on
+   * the shared web:main home, #519). The runtime owner is realized entirely by
+   * the launcher's mounts/loads in container-runner; agent-runner does not read
+   * this field. Kept here only to keep the ContainerInput mirror symmetric.
+   */
+  runtimeOwnerId?: string | null;
   /** Runtime context audit bootstrap from the host/container launcher. */
   contextAudit?: ClaudeContextAudit;
 }

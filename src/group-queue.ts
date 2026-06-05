@@ -57,6 +57,15 @@ interface GroupState {
    * Subsequent IPC-injected messages during an active run do NOT change it.
    */
   currentRunInitiator: string | null;
+  /**
+   * HappyClaw user id whose runtime (plugins / MCP / global memory) the current
+   * run loaded — the message sender on the active-admins-shared web:main home
+   * (#519 step 3/4), else the group's created_by. Stamped at registerProcess,
+   * cleared on idle. sendMessage() refuses to inject a different admin's message
+   * into this run (it would execute under the wrong admin's runtime); the caller
+   * starts a fresh run instead, whose cold-start re-resolves the owner.
+   */
+  runtimeOwnerId: string | null;
 }
 
 type ActiveGroupState = GroupState & { groupFolder: string };
@@ -116,6 +125,7 @@ export class GroupQueue {
         drainSentinelWritten: false,
         hasIpcInjectedMessages: false,
         currentRunInitiator: null,
+        runtimeOwnerId: null,
       };
       this.groups.set(groupJid, state);
     }
@@ -585,6 +595,8 @@ export class GroupQueue {
       agentId?: string;
       taskRunId?: string;
       selectedProviderId?: string | null;
+      /** Runtime owner of this run (#519): whose plugins/MCP/memory it loaded. */
+      runtimeOwnerId?: string | null;
     },
   ): void {
     const state = this.getGroup(groupJid);
@@ -595,6 +607,7 @@ export class GroupQueue {
     state.agentId = opts.agentId || null;
     state.taskRunId = opts.taskRunId || null;
     state.selectedProviderId = opts.selectedProviderId ?? null;
+    state.runtimeOwnerId = opts.runtimeOwnerId ?? null;
   }
 
   /**
@@ -638,9 +651,29 @@ export class GroupQueue {
     images?: Array<{ data: string; mimeType?: string }>,
     onInjected?: () => void,
     sourceJid?: string,
+    injectOwnerId?: string | null,
   ): SendMessageResult {
     const state = this.resolveActiveState(groupJid);
     if (!state) return 'no_active';
+
+    // #519 step 4: the active runner is loaded for one admin's runtime
+    // (plugins / MCP / global memory). Injecting a *different* admin's message
+    // would run it under the wrong admin's plugins and write to their memory.
+    // Defer to a fresh run instead — its cold-start re-resolves the runtime
+    // owner from the new sender. Only fires on the shared web:main home, where
+    // the new batch's owner differs from the run's owner; on every other group
+    // both equal created_by, so this is a no-op.
+    if (
+      injectOwnerId != null &&
+      state.runtimeOwnerId != null &&
+      injectOwnerId !== state.runtimeOwnerId
+    ) {
+      logger.debug(
+        { groupJid, injectOwnerId, activeOwner: state.runtimeOwnerId },
+        'GroupQueue.sendMessage: runtime owner mismatch, deferring to a fresh run',
+      );
+      return 'no_active';
+    }
 
     // If the active runner is a scheduled task (not a user-message handler),
     // do NOT pipe user messages into it.  The task container has no knowledge
@@ -1209,6 +1242,7 @@ export class GroupQueue {
       state.agentId = null;
       state.taskRunId = null;
       state.currentRunInitiator = null;
+      state.runtimeOwnerId = null;
       this.activeCount--;
       if (isHostMode) {
         this.activeHostProcessCount--;
