@@ -8,6 +8,7 @@ import {
   ContainerEnvSchema,
 } from '../schemas.js';
 import type { AuthUser, RegisteredGroup, ExecutionMode } from '../types.js';
+import { canAdminShareMainHome } from '../main-home-acl.js';
 import { checkGroupLimit } from '../billing.js';
 import { DATA_DIR, GROUPS_DIR, isDockerAvailable } from '../config.js';
 import {
@@ -149,8 +150,15 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
     if (!isWeb && !isHome && homeFolders.has(group.folder)) continue;
 
     // Hide other users' home groups from the chat sidebar.
-    // Each user only sees their own home container.
-    if (isHome && group.created_by !== user.id) continue;
+    // Each user only sees their own home container — except web:main
+    // (folder === 'main'), the active-admins-shared admin home (issue #519,
+    // option B), which every active admin sees.
+    if (
+      isHome &&
+      group.created_by !== user.id &&
+      !canAdminShareMainHome(group, user)
+    )
+      continue;
 
     // Host execution groups require admin unless it's the user's own home group
     if (isHost && !isAdmin && !(isHome && group.created_by === user.id))
@@ -225,7 +233,13 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
       execution_mode: group.executionMode || 'container',
       custom_cwd: isAdmin ? group.customCwd : undefined,
       is_home: isHome || undefined,
-      is_my_home: (isHome && group.created_by === user.id) || undefined,
+      // web:main (folder === 'main') is the active-admins-shared admin home
+      // (issue #519, option B): every active admin treats it as their home so
+      // the sidebar home slot, default selection, and IM-binding panel resolve.
+      is_my_home:
+        ((isHome && group.created_by === user.id) ||
+          canAdminShareMainHome(group, user)) ||
+        undefined,
       is_shared: isShared || undefined,
       member_role: memberInfo?.role ?? undefined,
       member_count: isShared ? memberInfo?.count : undefined,

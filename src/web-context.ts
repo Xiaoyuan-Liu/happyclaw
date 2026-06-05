@@ -10,6 +10,7 @@ import type {
   UserSessionWithUser,
 } from './types.js';
 import type { RuntimeOwnerCandidateUser } from './runtime-owner.js';
+import { canAdminShareMainHome } from './main-home-acl.js';
 import {
   getJidsByFolder,
   getRegisteredGroup,
@@ -279,16 +280,23 @@ export function hasHostExecutionPermission(user: AuthUser): boolean {
 /**
  * Check if a user can access (view messages, send messages to) a group.
  * All users (including admin) follow the same visibility rules:
- * - is_home groups → only the owner (created_by) can access
+ * - is_home groups → only the owner (created_by) can access, EXCEPT web:main
+ *   (folder === 'main'), the active-admins-shared admin home (issue #519,
+ *   option B), which any active admin can access
  * - IM groups (jid does not start with 'web:') → owner or group_members
- * - folder === 'main' → only the admin who owns it
  * - Web groups → created_by matches user.id, or user is in group_members
  */
 export function canAccessGroup(
   user: { id: string; role: UserRole },
   group: RegisteredGroup & { jid: string },
 ): boolean {
-  if (group.is_home) return group.created_by === user.id;
+  if (group.is_home) {
+    if (group.created_by === user.id) return true;
+    // web:main is the active-admins-shared admin home (issue #519, option B):
+    // any active admin may access it, not just the bootstrap admin in created_by.
+    if (canAdminShareMainHome(group, user)) return true;
+    return false;
+  }
   // IM groups: check ownership if created_by is set.
   // For legacy rows without created_by, resolve owner from sibling home group.
   if (!group.jid.startsWith('web:')) {
@@ -307,11 +315,11 @@ export function canAccessGroup(
     // Ownership cannot be resolved for this IM group → deny by default.
     return false;
   }
-  // folder === 'main': only accessible by the admin who owns it (via created_by or group_members)
-  if (group.folder === 'main') {
-    if (group.created_by === user.id) return true;
-    return getGroupMemberRole(group.folder, user.id) !== null;
-  }
+  // True web: non-home workspaces: owner or shared member. web:main itself is
+  // is_home and handled in the is_home branch above; and since folder === 'main'
+  // is always is_home, it never reaches here, so no separate branch is needed.
+  // (web:main's IM siblings have non-'web:' jids — feishu:/telegram:/… — so they
+  // are resolved in the !startsWith('web:') branch above, never here.)
   if (group.created_by === user.id) return true;
   // Check group_members table for shared workspaces
   return getGroupMemberRole(group.folder, user.id) !== null;

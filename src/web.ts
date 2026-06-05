@@ -24,6 +24,7 @@ import {
   getCachedSessionWithUser,
   invalidateSessionCache,
 } from './web-context.js';
+import { isMainHome } from './main-home-acl.js';
 
 // Schemas
 import {
@@ -74,6 +75,7 @@ import {
   deleteUserSession,
   updateSessionLastActive,
   getGroupMembers,
+  getActiveAdminIds,
   getAgent,
   isGroupShared,
   getUserById,
@@ -1713,6 +1715,13 @@ const ALLOWED_CACHE_TTL = 10_000; // 10 seconds
 
 function getGroupAllowedUserIds(chatJid: string): Set<string> | null {
   const now = Date.now();
+  // web:main's allow-set is the LIVE active-admin roster (issue #519): it changes
+  // via admin role/status mutations (admin.ts) that have no hook into this cache.
+  // Recompute it every time — two tiny indexed queries — rather than risk a
+  // just-promoted admin missing broadcasts, or a just-demoted one still receiving
+  // them, for up to the 10s TTL. Every other group's set only changes on
+  // membership ops, which already call invalidateAllowedUserCache.
+  if (chatJid === 'web:main') return computeGroupAllowedUserIds(chatJid);
   const cached = allowedUserIdsCache.get(chatJid);
   if (cached && cached.expiry > now) return cached.ids;
 
@@ -1760,11 +1769,9 @@ function computeGroupAllowedUserIds(chatJid: string): Set<string> | null {
     }
   }
 
-  if (!ownerId) {
-    if (group.is_home) return null;
-    if (group.folder === 'main') return null;
-    return null; // Unresolvable → deny by default
-  }
+  // Unresolvable owner → deny by default (admin-only). web:main never lands here
+  // (its created_by is always set), so no folder==='main' special-case is needed.
+  if (!ownerId) return null;
 
   allowed.add(ownerId);
 
@@ -1773,6 +1780,13 @@ function computeGroupAllowedUserIds(chatJid: string): Set<string> | null {
     const members = getGroupMembers(group.folder);
     for (const m of members) {
       allowed.add(m.user_id);
+    }
+  } else if (isMainHome(group)) {
+    // web:main is the active-admins-shared admin home (issue #519, option B):
+    // every active admin must receive its broadcasts, not just created_by.
+    // Queried live so a disabled admin stops receiving immediately.
+    for (const id of getActiveAdminIds()) {
+      allowed.add(id);
     }
   }
 

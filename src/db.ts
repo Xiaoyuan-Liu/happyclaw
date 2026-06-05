@@ -3728,6 +3728,20 @@ export function getActiveAdminCount(): number {
   return row.count;
 }
 
+/**
+ * Ids of every active admin. `web:main` is the active-admins-shared admin home
+ * (issue #519, option B), so these are the users who may access it and must
+ * receive its broadcasts — beyond the single bootstrap admin in `created_by`.
+ */
+export function getActiveAdminIds(): string[] {
+  const rows = db
+    .prepare(
+      `SELECT id FROM users WHERE role = 'admin' AND status = 'active'`,
+    )
+    .all() as Array<{ id: string }>;
+  return rows.map((r) => r.id);
+}
+
 export function updateUserFields(
   id: string,
   updates: Partial<

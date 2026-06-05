@@ -7,7 +7,7 @@ Issue #518 follow-up。记录所有 Web API / WebSocket / IM 操作的权限级�
 | 级别 | 函数 / 中间件 | 含义 |
 |------|--------------|------|
 | Login | `authMiddleware` | 已登录即可 |
-| Access | `canAccessGroup(user, group)` | owner 或 `group_members` 成员 |
+| Access | `canAccessGroup(user, group)` | owner 或 `group_members` 成员；**例外**：`web:main`（admin home）对所有 active admin 开放（见下方说明 + #519） |
 | Modify | `canModifyGroup(user, group)` | 仅 owner（`created_by`） |
 | Delete | `canDeleteGroup(user, group)` | 仅 owner，且非 home group |
 | ManageMembers | `canManageGroupMembers(user, group)` | 仅 owner，且非 home group |
@@ -20,6 +20,8 @@ Issue #518 follow-up。记录所有 Web API / WebSocket / IM 操作的权限级�
 | Public | 无 | 无需认证 |
 
 > **补充说明**：所有涉及 host 执行模式的群组操作，在基础 ACL 检查之上，还会额外检查 `isHostExecutionGroup(group) && hasHostExecutionPermission(user)`，非 admin 无法操作 host 模式群组。下表中标注 `+HostPerm` 表示此额外检查。
+
+> **`web:main` admin 共享例外（issue #519 option B）**：`web:main`（`folder === 'main'`，全库唯一的 admin home）的 **Access 不是 owner-only**——所有 active admin 都可访问，即所有走 `canAccessGroup` 的操作（读/发消息、文件、任务、agents、env 等）对 active admin 开放，由 `canAdminShareMainHome()`（`src/main-home-acl.ts`）放开。但其 **Modify / Delete / ManageMembers 仍是 owner-only**（`created_by`）：第二个 admin 看得到 `web:main` 也能在里面协作，但不能 rename / reset-session / 改成员。这条"访问放开、修改收紧"的非对称是刻意的，详见 `docs/ADMIN-SHARED-WORKSPACE.md`。
 
 ## HTTP 路由
 
