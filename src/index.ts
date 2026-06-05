@@ -48,6 +48,7 @@ import {
   getLastGroupSync,
   getRegisteredGroup,
   getUserById,
+  getActiveAdminIds,
   getMessagesSince,
   getNewMessages,
   getRouterState,
@@ -188,6 +189,7 @@ import {
   resolveAdminSharedRuntimeOwner,
 } from './runtime-owner.js';
 import { checkOwnerActive } from './owner-gate.js';
+import { isMainHome, evaluateOwnerGate } from './main-home-acl.js';
 import {
   ensureAgentDirectories,
   isSystemMaintenanceNoise,
@@ -6123,27 +6125,36 @@ async function processAgentConversation(
   // before it), so conversation-agent traffic only reaches this gate. When the
   // owner is disabled/deleted, advance the cursor past the pending messages so
   // they aren't replayed, then drop. See `src/owner-gate.ts` for rationale.
-  if (effectiveGroup.created_by) {
-    const ownerGate = checkOwnerActive(getUserById(effectiveGroup.created_by));
-    if (!ownerGate.allowed) {
-      const lastMsg = missedMessages[missedMessages.length - 1];
-      if (lastMsg) {
-        setCursors(virtualChatJid, {
-          timestamp: lastMsg.timestamp,
-          id: lastMsg.id,
-        });
-      }
-      logger.info(
-        {
-          chatJid,
-          agentId,
-          userId: effectiveGroup.created_by,
-          ownerStatus: ownerGate.status,
-        },
-        'Dropping agent conversation: owner is not active',
-      );
-      return;
+  // Shared web:main (#519): same gate as the main message loop — do not drop on
+  // the bootstrap `created_by` being inactive (that would lock every active
+  // admin out of shared agent conversations); only drop when no active admin
+  // remains. Other groups still gate on their owner's status.
+  const ownerGate = evaluateOwnerGate(effectiveGroup, {
+    hasActiveAdmin: () => getActiveAdminIds().length > 0,
+    checkOwner: (id) => checkOwnerActive(getUserById(id)),
+  });
+  if (ownerGate.drop) {
+    const lastMsg = missedMessages[missedMessages.length - 1];
+    if (lastMsg) {
+      setCursors(virtualChatJid, {
+        timestamp: lastMsg.timestamp,
+        id: lastMsg.id,
+      });
     }
+    logger.info(
+      ownerGate.reason === 'inactive_owner'
+        ? {
+            chatJid,
+            agentId,
+            userId: effectiveGroup.created_by,
+            ownerStatus: ownerGate.ownerStatus,
+          }
+        : { chatJid, agentId },
+      ownerGate.reason === 'inactive_owner'
+        ? 'Dropping agent conversation: owner is not active'
+        : 'Dropping agent conversation: no active admin owns shared web:main',
+    );
+    return;
   }
   if (missedMessages.length === 0) {
     // Spawn agents are fire-and-forget: if no messages are found (race condition
@@ -7206,31 +7217,40 @@ async function startMessageLoop(): Promise<void> {
           // to conversation agents at IM ingestion time (feishu.ts/telegram.ts)
           if (group.target_agent_id) continue;
 
-          // Owner gate + billing share a single owner lookup. Owner status
-          // check first: drop messages from groups whose owner is
-          // disabled/deleted (see `src/owner-gate.ts`); billing quota check
-          // second.
-          if (group.created_by) {
-            const owner = getUserById(group.created_by);
-            const ownerGate = checkOwnerActive(owner);
-            if (!ownerGate.allowed) {
-              const lastMsg = groupMessages[groupMessages.length - 1];
-              setCursors(chatJid, {
-                timestamp: lastMsg.timestamp,
-                id: lastMsg.id,
-              });
-              logger.info(
-                {
-                  chatJid,
-                  userId: group.created_by,
-                  ownerStatus: ownerGate.status,
-                },
-                'Dropping message: group owner is not active',
-              );
-              continue;
-            }
+          // Owner gate (#519): web:main is shared by every active admin, so it
+          // gates on active-admin presence — not the bootstrap `created_by`,
+          // which may be a since-disabled/deleted admin. Other groups still gate
+          // on their owner's status. See main-home-acl.ts / owner-gate.ts.
+          const ownerGate = evaluateOwnerGate(group, {
+            hasActiveAdmin: () => getActiveAdminIds().length > 0,
+            checkOwner: (id) => checkOwnerActive(getUserById(id)),
+          });
+          if (ownerGate.drop) {
+            const lastMsg = groupMessages[groupMessages.length - 1];
+            setCursors(chatJid, {
+              timestamp: lastMsg.timestamp,
+              id: lastMsg.id,
+            });
+            logger.info(
+              ownerGate.reason === 'inactive_owner'
+                ? {
+                    chatJid,
+                    userId: group.created_by,
+                    ownerStatus: ownerGate.ownerStatus,
+                  }
+                : { chatJid },
+              ownerGate.reason === 'inactive_owner'
+                ? 'Dropping message: group owner is not active'
+                : 'Dropping message: no active admin owns shared web:main',
+            );
+            continue;
+          }
 
-            // Billing quota check before processing
+          // Billing quota check before processing. Only non-home / non-admin
+          // owners are metered; web:main's owner is an admin, so isMainHome
+          // groups (which passed the gate above) never reach this.
+          if (!isMainHome(group) && group.created_by) {
+            const owner = getUserById(group.created_by);
             if (owner && owner.role !== 'admin') {
               const accessResult = checkBillingAccessFresh(
                 group.created_by,

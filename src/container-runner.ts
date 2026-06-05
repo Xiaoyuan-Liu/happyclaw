@@ -159,11 +159,19 @@ const REQUIRED_SETTINGS_ENV: Record<string, string> = {
   CLAUDE_CODE_DISABLE_ATTACHMENTS: '1',
 };
 
-/** Read existing settings.json, deep-merge required env keys and mcpServers, write only if changed */
-function ensureSettingsJson(
-  settingsFile: string,
-  mcpServers?: Record<string, Record<string, unknown>>,
-): void {
+/**
+ * Read existing settings.json, force the required env keys, and DROP any
+ * persisted `mcpServers` block, writing only if the content changed.
+ *
+ * Per-user MCP servers are injected per-run via the HAPPYCLAW_USER_MCP_SERVERS_JSON
+ * env var (ephemeral, derived from the run's runtime owner — mirrors how plugins
+ * are injected) and are no longer persisted into this per-folder file. Pruning here
+ * also self-heals files written by older builds, where a previous runtime owner's
+ * MCP servers (and their credentials) would otherwise additively accumulate and
+ * leak into the next owner's run on a shared workspace — web:main is shared by every
+ * active admin (#519).
+ */
+export function ensureSettingsJson(settingsFile: string): void {
   let existing: Record<string, unknown> = {};
   try {
     if (fs.existsSync(settingsFile)) {
@@ -177,11 +185,9 @@ function ensureSettingsJson(
   const mergedEnv = { ...existingEnv, ...REQUIRED_SETTINGS_ENV };
   const merged: Record<string, unknown> = { ...existing, env: mergedEnv };
 
-  // Merge user-configured MCP servers into settings
-  if (mcpServers && Object.keys(mcpServers).length > 0) {
-    const existingMcp = (existing.mcpServers as Record<string, unknown>) || {};
-    merged.mcpServers = { ...existingMcp, ...mcpServers };
-  }
+  // MCP servers are injected per-run via env, never persisted into this shared
+  // per-folder file. Drop any block left by this or an older build.
+  delete merged.mcpServers;
 
   const newContent = JSON.stringify(merged, null, 2) + '\n';
 
@@ -196,6 +202,22 @@ function ensureSettingsJson(
   }
 
   fs.writeFileSync(settingsFile, newContent, { mode: 0o644 });
+}
+
+/**
+ * Per-run MCP server env for a given runtime owner. Injected into the agent
+ * process (host: `hostEnv`; docker: `-e`) instead of the shared per-folder
+ * settings.json, so on a shared workspace each runtime owner only ever sees
+ * their own MCP servers (#519). agent-runner's loadUserMcpServers() reads this
+ * env first; the empty `{}` is set explicitly so it overrides any mcpServers a
+ * stale settings.json from an older build still carries. Symmetric with the
+ * per-run plugin injection (loadUserPlugins → ContainerInput.plugins).
+ */
+export function buildUserMcpEnv(
+  ownerId: string | null | undefined,
+): Record<string, string> {
+  const servers = ownerId ? loadUserMcpServers(ownerId) : {};
+  return { HAPPYCLAW_USER_MCP_SERVERS_JSON: JSON.stringify(servers) };
 }
 
 export interface ContainerInput {
@@ -626,9 +648,12 @@ export function buildVolumeMounts(
     groupSessionsDir,
     mountUserSkills,
   });
+  // Per-user MCP servers are injected per-run via env (see buildUserMcpEnv,
+  // passed as `-e` in runContainerAgent), not persisted into this per-folder
+  // settings.json — otherwise a previous runtime owner's servers would leak
+  // into the next owner's run on a shared workspace (#519).
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  const mcpServers = ownerId ? loadUserMcpServers(ownerId) : {};
-  ensureSettingsJson(settingsFile, mcpServers);
+  ensureSettingsJson(settingsFile);
 
   mounts.push({
     hostPath: groupSessionsDir,
@@ -898,11 +923,20 @@ function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
   tz: string,
+  extraEnv?: Record<string, string>,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
   // Set timezone so container Node.js processes use local time (Asia/Shanghai)
   args.push('-e', `TZ=${tz}`);
+
+  // Per-run env (e.g. per-user MCP servers). Spawned via an arg array, so each
+  // value is passed literally with no shell interpretation.
+  if (extraEnv) {
+    for (const [key, value] of Object.entries(extraEnv)) {
+      args.push('-e', `${key}=${value}`);
+    }
+  }
 
   // Docker: -v with :ro suffix for readonly
   for (const mount of mounts) {
@@ -976,7 +1010,15 @@ export async function runContainerAgent(
       ? `-${input.agentId.replace(/[^a-zA-Z0-9-]/g, '-')}`
       : '';
     const containerName = `happyclaw-${safeName}${agentSuffix}-${Date.now()}`;
-    const containerArgs = buildContainerArgs(mounts, containerName, TIMEZONE);
+    // Runtime owner for this run (#519): on the shared web:main home this is the
+    // message sender, not group.created_by. MCP servers ride it per-run via env.
+    const dockerRuntimeOwner = input.runtimeOwnerId ?? group.created_by;
+    const containerArgs = buildContainerArgs(
+      mounts,
+      containerName,
+      TIMEZONE,
+      buildUserMcpEnv(dockerRuntimeOwner),
+    );
 
     logger.debug(
       {
@@ -1024,7 +1066,6 @@ export async function runContainerAgent(
       });
       // Derive a new input with docker-runtime plugins injected; never mutate
       // the caller's `input` object (queue/log/retry paths reuse the same ref).
-      const dockerRuntimeOwner = input.runtimeOwnerId ?? group.created_by;
       const dockerInput: ContainerInput = {
         ...input,
         plugins: dockerRuntimeOwner
@@ -1447,12 +1488,12 @@ export async function runHostAgent(
   const localJson = path.join(groupSessionsDir, '.claude.json');
   ensureSymlinkTo(localJson, ensureHostClaudeJson());
 
-  // 3. 写入 settings.json（合并模式，不覆盖已有用户配置）
-  // Load user's global MCP servers (same logic as Docker mode).
+  // 3. 写入 settings.json（仅强制必需 env keys）。per-user MCP servers 改走 env
+  //    透传（见下方 hostEnv），不再写入 per-folder 的 settings.json，避免共享
+  //    web:main 上跨 runtime owner 的 MCP/凭据泄漏（#519）。
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   const hostMcpOwner = input.runtimeOwnerId ?? group.created_by;
-  const hostMcpServers = hostMcpOwner ? loadUserMcpServers(hostMcpOwner) : {};
-  ensureSettingsJson(settingsFile, hostMcpServers);
+  ensureSettingsJson(settingsFile);
 
   // 4. Skills / Rules / CLAUDE.md 自动链接到 session 目录
   const hostClaudeContextPlan = buildClaudeContextPlan({
@@ -1645,12 +1686,12 @@ export async function runHostAgent(
       for (const [key, value] of Object.entries(REQUIRED_SETTINGS_ENV)) {
         hostEnv[key] = value;
       }
-      // 同样，per-user MCP servers 通过 env 透传，agent-runner 合并进 SDK mcpServers 参数。
-      if (hostMcpServers && Object.keys(hostMcpServers).length > 0) {
-        hostEnv['HAPPYCLAW_USER_MCP_SERVERS_JSON'] =
-          JSON.stringify(hostMcpServers);
-      }
     }
+    // per-user MCP servers 一律通过 env 透传（per-run、不落盘，与 plugins 注入对称）：
+    // 不再写入 per-folder 的 settings.json，避免共享 web:main 上跨 runtime owner
+    // 的 MCP/凭据泄漏（#519）。空集也显式设置以覆盖旧版本残留的 settings.json
+    // 条目（agent-runner loadUserMcpServers() env 优先）。
+    Object.assign(hostEnv, buildUserMcpEnv(hostMcpOwner));
     // 让 SDK 捕获 CLI 的 stderr 输出，便于排查启动失败
     hostEnv['DEBUG_CLAUDE_AGENT_SDK'] = '1';
     // Claude Code 2.1.114+ 禁止 root 使用 --dangerously-skip-permissions，

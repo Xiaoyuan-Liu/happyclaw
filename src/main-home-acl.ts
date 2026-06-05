@@ -11,6 +11,7 @@
 // Kept dependency-free (like cross-group-acl.ts / owner-gate.ts) so the rule is
 // unit-testable without mocking the db / queue / socket graph.
 
+import type { OwnerGateResult } from './owner-gate.js';
 import type { UserRole } from './types.js';
 
 /**
@@ -38,4 +39,45 @@ export function canAdminShareMainHome(
   user: { role: UserRole },
 ): boolean {
   return isMainHome(group) && user.role === 'admin';
+}
+
+/** Verdict of the message/agent-conversation owner gate (#519). */
+export type OwnerGateVerdict =
+  | { drop: false }
+  | { drop: true; reason: 'no_active_admin' }
+  | { drop: true; reason: 'inactive_owner'; ownerStatus: string };
+
+/**
+ * Decide whether a dispatch loop must DROP a pending batch because the workspace
+ * has no active owner to run it under (#519).
+ *
+ * - Shared web:main home: do NOT pin to the bootstrap `created_by` (which may be
+ *   a since-disabled/deleted admin) — that would lock every active admin out of
+ *   the shared home. Drop only when no active admin remains to own it; the run's
+ *   cold-start then resolves the runtime owner from the active-admin sender.
+ * - Any other group: drop when its `created_by` owner is disabled/deleted (the
+ *   pre-existing owner gate, see owner-gate.ts).
+ *
+ * Pure: callers inject the lookups, so it is unit-testable without a running
+ * loop (mirrors the runtime-owner.ts resolver style used across #519).
+ */
+export function evaluateOwnerGate(
+  group: { is_home?: boolean | null; folder: string; created_by?: string | null },
+  deps: {
+    hasActiveAdmin: () => boolean;
+    checkOwner: (userId: string) => OwnerGateResult;
+  },
+): OwnerGateVerdict {
+  if (isMainHome(group)) {
+    return deps.hasActiveAdmin()
+      ? { drop: false }
+      : { drop: true, reason: 'no_active_admin' };
+  }
+  if (group.created_by) {
+    const gate = deps.checkOwner(group.created_by);
+    if (!gate.allowed) {
+      return { drop: true, reason: 'inactive_owner', ownerStatus: gate.status };
+    }
+  }
+  return { drop: false };
 }

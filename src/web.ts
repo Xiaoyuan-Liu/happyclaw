@@ -588,6 +588,21 @@ async function handleWebUserMessage(
   let pipedToActive = false;
   const images = toAgentImages(normalizedAttachments);
   const updateRoute = deps.updateReplyRoute;
+  // #519 step 4: on the shared web:main home, resolve this message's runtime
+  // owner (the active-admin sender) so the queue's owner-mismatch guard defers
+  // it to a fresh run instead of injecting admin B's message into admin A's
+  // active runtime (which would run under A's plugins/MCP and write B's memory
+  // into A's user-global dir). The message is already persisted above, so a
+  // 'no_active' result lets the poll loop cold-start it under B's runtime — no
+  // loss. On every other group this resolves to created_by, so the guard is a
+  // no-op (unchanged behavior). Mirrors src/index.ts injection-site resolution.
+  const injectOwnerId = resolvePerMessageRuntimeOwner({
+    chatJid,
+    isHome: !!group.is_home,
+    fallbackOwner: group.created_by,
+    message: { sender: userId },
+    getUserById,
+  });
   const sendResult = deps.queue.sendMessage(
     chatJid,
     formatted,
@@ -598,6 +613,7 @@ async function handleWebUserMessage(
       updateRoute?.(group.folder, null);
     },
     chatJid,
+    injectOwnerId,
   );
   if (sendResult === 'sent') {
     pipedToActive = true;

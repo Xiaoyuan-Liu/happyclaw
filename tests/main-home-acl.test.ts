@@ -1,6 +1,11 @@
 import { describe, expect, test } from 'vitest';
 
-import { isMainHome, canAdminShareMainHome } from '../src/main-home-acl.js';
+import {
+  isMainHome,
+  canAdminShareMainHome,
+  evaluateOwnerGate,
+} from '../src/main-home-acl.js';
+import { checkOwnerActive } from '../src/owner-gate.js';
 
 /**
  * Pure-predicate tests for the active-admins-shared admin home (`web:main`),
@@ -67,5 +72,67 @@ describe('canAdminShareMainHome', () => {
 
   test("folder 'main' without is_home is rejected even for an admin", () => {
     expect(canAdminShareMainHome(nonHomeMain, { role: 'admin' })).toBe(false);
+  });
+});
+
+describe('evaluateOwnerGate (#519 — owner-gate lockout)', () => {
+  // The bug this guards: the dispatch loops gated web:main on the bootstrap
+  // `created_by`. Once that admin is disabled/deleted, every active admin's
+  // message was dropped (permanent loss + lockout), contradicting option B.
+  const allAdminsGone = { hasActiveAdmin: () => false, checkOwner: noOwner };
+  function noOwner(): ReturnType<typeof checkOwnerActive> {
+    throw new Error('checkOwner must not be consulted on web:main');
+  }
+  const usersById: Record<string, { status: string } | null> = {
+    bootstrapAdmin: { status: 'deleted' },
+    activeMember: { status: 'active' },
+    disabledMember: { status: 'disabled' },
+  };
+  const checkOwner = (id: string) => checkOwnerActive(usersById[id]);
+
+  test('web:main: an active admin exists → process even if bootstrap created_by is deleted', () => {
+    // The defining option-B fix: the gate must NOT consult created_by for
+    // web:main — it gates purely on active-admin presence.
+    const gate = evaluateOwnerGate(
+      { ...mainHome, created_by: 'bootstrapAdmin' },
+      { hasActiveAdmin: () => true, checkOwner: noOwner },
+    );
+    expect(gate.drop).toBe(false);
+  });
+
+  test('web:main: NO active admin remains → drop with no_active_admin reason', () => {
+    const gate = evaluateOwnerGate(
+      { ...mainHome, created_by: 'bootstrapAdmin' },
+      allAdminsGone,
+    );
+    expect(gate).toEqual({ drop: true, reason: 'no_active_admin' });
+  });
+
+  test('non-home group: active owner → process', () => {
+    const gate = evaluateOwnerGate(
+      { is_home: false, folder: 'ws-x', created_by: 'activeMember' },
+      { hasActiveAdmin: () => true, checkOwner },
+    );
+    expect(gate.drop).toBe(false);
+  });
+
+  test('non-home group: disabled owner → drop with inactive_owner reason + status', () => {
+    const gate = evaluateOwnerGate(
+      { is_home: false, folder: 'ws-x', created_by: 'disabledMember' },
+      { hasActiveAdmin: () => true, checkOwner },
+    );
+    expect(gate).toEqual({
+      drop: true,
+      reason: 'inactive_owner',
+      ownerStatus: 'disabled',
+    });
+  });
+
+  test('group without created_by is never dropped (legacy)', () => {
+    const gate = evaluateOwnerGate(
+      { is_home: false, folder: 'ws-x' },
+      { hasActiveAdmin: () => false, checkOwner: noOwner },
+    );
+    expect(gate.drop).toBe(false);
   });
 });

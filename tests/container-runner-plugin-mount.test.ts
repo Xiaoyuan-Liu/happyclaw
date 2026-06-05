@@ -57,7 +57,8 @@ const catalog = await import('../src/plugin-catalog.js');
 const utils = await import('../src/plugin-utils.js');
 const materializer = await import('../src/plugin-materializer.js');
 
-const { buildVolumeMounts, prepareHostPlugins } = containerRunner;
+const { buildVolumeMounts, prepareHostPlugins, ensureSettingsJson, buildUserMcpEnv } =
+  containerRunner;
 const { writeCatalogIndex, getCatalogSnapshotDir } = catalog;
 const { CONTAINER_PLUGINS_PATH } = utils;
 const { getUserRuntimeRoot, getUserPluginRuntimeDir } = materializer;
@@ -298,6 +299,72 @@ describe('buildVolumeMounts — runtime owner override (#519 step 3)', () => {
     expect(
       mounts.find((m) => m.containerPath === '/workspace/global')!.hostPath,
     ).toBe(path.join(groupsDir, 'user-global', 'owner1'));
+  });
+});
+
+function seedUserMcpServers(
+  userId: string,
+  servers: Record<string, Record<string, unknown>>,
+): void {
+  const dir = path.join(tmpDataDir, 'mcp-servers', userId);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'servers.json'), JSON.stringify({ servers }));
+}
+
+describe('per-run MCP server isolation (#519)', () => {
+  test('ensureSettingsJson purges a stale mcpServers block and keeps env keys', () => {
+    // Old builds additively merged per-user MCP servers into this per-folder file.
+    // On the now-shared web:main home, admin A's servers (and their credentials)
+    // would survive and leak into admin B's run. ensureSettingsJson must drop the
+    // block entirely (MCP is injected per-run via env instead).
+    const settingsFile = path.join(tmpDataDir, 'settings.json');
+    fs.writeFileSync(
+      settingsFile,
+      JSON.stringify({
+        mcpServers: { adminA_server: { command: 'secret-a', env: { TOKEN: 'A' } } },
+        env: { USER_CUSTOM: 'keep-me' },
+        otherKey: 42,
+      }),
+    );
+
+    ensureSettingsJson(settingsFile);
+
+    const written = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+    expect(written.mcpServers).toBeUndefined(); // leak purged
+    expect(written.env.CLAUDE_CODE_DISABLE_ATTACHMENTS).toBe('1'); // required env forced
+    expect(written.env.USER_CUSTOM).toBe('keep-me'); // user env preserved
+    expect(written.otherKey).toBe(42); // unrelated keys preserved
+  });
+
+  test('buildUserMcpEnv returns only the runtime owner\'s servers, never another admin\'s', () => {
+    seedUserMcpServers('adminA', {
+      adminA_server: { enabled: true, command: 'a-cmd' },
+    });
+    seedUserMcpServers('adminB', {
+      adminB_server: { enabled: true, command: 'b-cmd' },
+    });
+
+    const parsedA = JSON.parse(
+      buildUserMcpEnv('adminA').HAPPYCLAW_USER_MCP_SERVERS_JSON,
+    );
+    const parsedB = JSON.parse(
+      buildUserMcpEnv('adminB').HAPPYCLAW_USER_MCP_SERVERS_JSON,
+    );
+
+    expect(Object.keys(parsedA)).toEqual(['adminA_server']);
+    expect(Object.keys(parsedB)).toEqual(['adminB_server']);
+    // The cross-admin leak: admin B's run must NEVER see admin A's MCP server.
+    expect(parsedB.adminA_server).toBeUndefined();
+  });
+
+  test('buildUserMcpEnv sets explicit {} for no owner / no servers (overrides stale settings.json)', () => {
+    // agent-runner reads this env first; an explicit "{}" overrides any mcpServers
+    // a stale settings.json from an older build still carries.
+    expect(buildUserMcpEnv(null).HAPPYCLAW_USER_MCP_SERVERS_JSON).toBe('{}');
+    expect(buildUserMcpEnv(undefined).HAPPYCLAW_USER_MCP_SERVERS_JSON).toBe('{}');
+    expect(
+      buildUserMcpEnv('userWithoutServers').HAPPYCLAW_USER_MCP_SERVERS_JSON,
+    ).toBe('{}');
   });
 });
 
