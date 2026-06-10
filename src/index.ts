@@ -187,7 +187,8 @@ import { resolveTaskOwner } from './task-utils.js';
 import {
   resolvePerMessageRuntimeOwner,
   resolveAdminSharedRuntimeOwner,
-  resolveLatestAdminSenderOverride,
+  resolveInjectionOwnerConstraint,
+  preferActiveAdminFallback,
 } from './runtime-owner.js';
 import { checkOwnerActive } from './owner-gate.js';
 import { isMainHome, evaluateOwnerGate } from './main-home-acl.js';
@@ -6111,7 +6112,7 @@ async function processAgentConversation(
   }
   if (!group) return;
 
-  const { effectiveGroup } = resolveEffectiveGroup(group);
+  let { effectiveGroup } = resolveEffectiveGroup(group);
 
   const virtualChatJid = `${chatJid}#agent:${agentId}`;
   const virtualJid = virtualChatJid; // used as queue key
@@ -6176,6 +6177,42 @@ async function processAgentConversation(
       );
     }
     return;
+  }
+
+  // Shared web:main (#519): agent conversations run under the latest active-
+  // admin sender's runtime — that admin's plugins/MCP load and global memory
+  // writes land in their own user-global directory, not the bootstrap admin's.
+  // The resolver strips the `#agent:` suffix (runtime-owner.ts baseJid gate),
+  // so the virtual JID gets web:main semantics. Rewriting effectiveGroup means
+  // every downstream consumer — the expander fallback ctx, registerProcess /
+  // containerInput runtimeOwnerId, and writeUsageRecords attribution — reads
+  // the rewritten created_by, intentionally consistent with the
+  // main-conversation cold-start path (processGroupMessages).
+  // IM-origin agent conversations carry open_id senders the sender walk cannot
+  // map to a HappyClaw admin, so it falls through to the fallback. auto_im
+  // agents stamp created_by = the binding admin (a reliable identity), so prefer
+  // it (when an active admin) over the bootstrap created_by — otherwise admin B's
+  // IM-bound agent would still run under admin A's plugins/MCP/memory, leaving the
+  // sub-agent leak open for the most common (IM-driven) flow.
+  const agentColdStartFallback = isMainHome(effectiveGroup)
+    ? preferActiveAdminFallback(
+        agent.created_by,
+        effectiveGroup.created_by,
+        getUserById,
+      )
+    : effectiveGroup.created_by;
+  const agentColdStartOwner = resolveAdminSharedRuntimeOwner({
+    chatJid: virtualChatJid,
+    isHome: !!effectiveGroup.is_home,
+    fallbackOwner: agentColdStartFallback,
+    messages: missedMessages,
+    getUserById,
+  });
+  if (
+    agentColdStartOwner &&
+    agentColdStartOwner !== effectiveGroup.created_by
+  ) {
+    effectiveGroup = { ...effectiveGroup, created_by: agentColdStartOwner };
   }
 
   const isHome = !!effectiveGroup.is_home;
@@ -6816,6 +6853,7 @@ async function processAgentConversation(
         displayName: identifier,
         agentId,
         selectedProviderId,
+        runtimeOwnerId: effectiveGroup.created_by,
       });
     };
 
@@ -6831,6 +6869,7 @@ async function processAgentConversation(
       agentId,
       agentName: agent.name,
       images: imagesForAgent,
+      runtimeOwnerId: effectiveGroup.created_by,
     };
 
     // Write tasks/groups snapshots
@@ -7395,20 +7434,30 @@ async function startMessageLoop(): Promise<void> {
           const lastSourceJidForRoute =
             messagesToSend[messagesToSend.length - 1]?.source_jid || chatJid;
 
-          // #519 step 4: the owner this injection batch *requires* (null = no
-          // constraint). On the shared web:main home, only an identifiable active-
-          // admin sender constrains the inject — so admin B's message never pipes
-          // into admin A's already-loaded runtime (mismatch → sendMessage returns
-          // 'no_active' → a fresh run cold-starts under B). IM-sibling senders
-          // (open_id, not a HappyClaw userId) resolve to null, so a same-admin IM
-          // follow-up still injects into that admin's active run instead of wrongly
-          // deferring to a bootstrap-owned fresh run (#8 — must NOT fall back to
-          // created_by here). On every non-web:main group injectOwnerId is null →
-          // the guard is a no-op (created_by == the run's owner there anyway).
+          // #519 step 4: the owner constraint this injection batch carries
+          // (null = no constraint). On the shared web:main home:
+          //   - exactly one identifiable active-admin sender → constrain the
+          //     inject to that admin (owner mismatch → sendMessage returns
+          //     'no_active' → a fresh run cold-starts under them);
+          //   - two or more distinct active-admin senders → MIXED_ADMIN_BATCH,
+          //     a sentinel matching no real user id, so the guard always
+          //     defers: a mixed-admin batch must never pipe into one admin's
+          //     live runtime. (The previous latest-sender resolution was
+          //     bypassable by interleave — batch [B_deferred, A_new] resolved
+          //     to A == the active owner, so B's text executed under A's
+          //     runtime.) The deferred cold-start still pins the whole mixed
+          //     batch to the latest active-admin sender — documented residual,
+          //     see docs/ADMIN-SHARED-WORKSPACE.md;
+          //   - IM-sibling senders (open_id, not a HappyClaw userId) → null,
+          //     so a same-admin IM follow-up still injects into that admin's
+          //     active run instead of wrongly deferring to a bootstrap-owned
+          //     fresh run (#8 — must NOT fall back to created_by here).
+          // On every non-web:main group injectOwnerId is null → the guard is
+          // a no-op (created_by == the run's owner there anyway).
           const { effectiveGroup: injEffectiveGroup } =
             resolveEffectiveGroup(group);
           const injectOwnerId = isMainHome(injEffectiveGroup)
-            ? resolveLatestAdminSenderOverride(messagesToSend, getUserById)
+            ? resolveInjectionOwnerConstraint(messagesToSend, getUserById)
             : null;
           const sendResult = queue.sendMessage(
             chatJid,
@@ -8459,6 +8508,24 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
 
       const lastAgentSourceJid =
         missedMessages[missedMessages.length - 1]?.source_jid || virtualChatJid;
+      // #519 step 4: same owner constraint as the main-loop injection site —
+      // the running agent process is loaded for one admin's runtime
+      // (registerProcess pins runtimeOwnerId), so a batch carrying a different
+      // admin's messages must defer to a fresh cold-start instead of piping
+      // into it. Never fall back to created_by here (#8 — IM open_id senders
+      // resolve to null so same-admin IM continuation still injects).
+      // Gate on the agent's WORKSPACE row (homeChatJid = agent.chat_jid, what
+      // the run actually targets), not the IM-binding row in `group` — a
+      // cross-folder /bind can make those diverge.
+      const workspaceRow =
+        registeredGroups[homeChatJid] ??
+        getRegisteredGroup(homeChatJid) ??
+        group;
+      const { effectiveGroup: agentInjEffectiveGroup } =
+        resolveEffectiveGroup(workspaceRow);
+      const injectOwnerId = isMainHome(agentInjEffectiveGroup)
+        ? resolveInjectionOwnerConstraint(missedMessages, getUserById)
+        : null;
       const sendResult = formatted
         ? queue.sendMessage(
             virtualChatJid,
@@ -8466,9 +8533,19 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
             imagesForAgent,
             undefined,
             lastAgentSourceJid,
+            injectOwnerId,
           )
         : 'no_active';
       if (sendResult === 'no_active') {
+        // A non-empty batch that returned 'no_active' was deferred by the #519
+        // owner-mismatch guard against a LIVE runner — drain it so the fresh
+        // cold-start starts promptly under the correct owner (mirrors the IM
+        // path above and the web.ts twin). Skip the drain when `formatted` is
+        // empty (no pending messages → nothing was deferred, so we must not
+        // tear down a warm idle runner for nothing).
+        if (formatted) {
+          queue.closeStdin(virtualChatJid);
+        }
         const taskId = `agent-conv:${agentId}:${Date.now()}`;
         queue.enqueueTask(virtualChatJid, taskId, async () => {
           await processAgentConversation(homeChatJid, agentId);

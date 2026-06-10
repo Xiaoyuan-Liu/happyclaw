@@ -15,7 +15,10 @@
  * registerProcess({ runtimeOwnerId }).
  */
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
+import fs from 'node:fs';
 import type { ChildProcess } from 'node:child_process';
+
+const TEST_DATA_DIR = '/tmp/happyclaw-queue-runtime-owner-test';
 
 vi.mock('../src/config.js', async (importOriginal) => {
   const real = (await importOriginal()) as Record<string, unknown>;
@@ -38,6 +41,7 @@ vi.mock('../src/runtime-config.js', () => ({
 vi.mock('../src/db.js', () => ({ getTaskById: () => undefined }));
 
 const { GroupQueue } = await import('../src/group-queue.js');
+const { MIXED_ADMIN_BATCH } = await import('../src/runtime-owner.js');
 
 const tick = () => new Promise((r) => setImmediate(r));
 const JID = 'web:main';
@@ -51,6 +55,10 @@ let resolveGate: (() => void) | null;
 let activeOwner: string | null;
 
 beforeEach(() => {
+  // Hermetic per test: earlier tests' sendMessage calls leave IPC .json files
+  // under the shared tmp DATA_DIR; recoverUnconsumedIpc in the run's finally
+  // would see them, re-arm pendingMessages and start an unwanted fresh run.
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
   queue = new GroupQueue();
   resolveGate = null;
   activeOwner = 'adminA';
@@ -85,6 +93,25 @@ describe('GroupQueue sendMessage runtime-owner guard (#519 step 4)', () => {
     ).toBe('no_active');
   });
 
+  test('MIXED_ADMIN_BATCH sentinel always defers (mixed-admin batch never pipes into a live run)', async () => {
+    // resolveInjectionOwnerConstraint returns this sentinel for a batch with two
+    // or more distinct active admins. It matches no real runtimeOwnerId, so the
+    // guard must always defer — this is the queue-side wiring of the interleave
+    // fix (the pure resolver is pinned in injection-owner-constraint.test.ts).
+    queue.enqueueMessageCheck(JID, 'adminA');
+    await tick();
+    expect(
+      queue.sendMessage(
+        JID,
+        'mixed [B, A]',
+        undefined,
+        undefined,
+        undefined,
+        MIXED_ADMIN_BATCH,
+      ),
+    ).toBe('no_active');
+  });
+
   test('allows the same admin to inject into their own active run (→ sent)', async () => {
     queue.enqueueMessageCheck(JID, 'adminA');
     await tick();
@@ -108,5 +135,27 @@ describe('GroupQueue sendMessage runtime-owner guard (#519 step 4)', () => {
     expect(
       queue.sendMessage(JID, 'x', undefined, undefined, undefined, 'adminB'),
     ).toBe('sent');
+  });
+});
+
+describe('GroupQueue runTask runtime-owner cleanup (#519)', () => {
+  test("runTask's finally clears the run's runtime owner (symmetric with runForGroup)", async () => {
+    let ownerDuringTask: string | null | undefined;
+    queue.enqueueTask(JID, 'task-1', async () => {
+      // Mirror production: a task run registers its process (with its runtime
+      // owner) while active, just like a message run does.
+      queue.registerProcess(JID, fakeProc(), {
+        containerName: 'c',
+        groupFolder: FOLDER,
+        runtimeOwnerId: 'adminA',
+      });
+      ownerDuringTask = (queue as any).groups.get(JID)?.runtimeOwnerId;
+    });
+    await tick();
+    await tick();
+    const state = (queue as any).groups.get(JID);
+    expect(ownerDuringTask).toBe('adminA'); // the owner really was stamped mid-run
+    expect(state?.active).toBe(false); // the real runTask finally has executed…
+    expect(state?.runtimeOwnerId).toBeNull(); // …and cleared the per-run owner
   });
 });

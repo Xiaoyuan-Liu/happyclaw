@@ -83,6 +83,62 @@ export function resolveAdminSharedRuntimeOwner(args: {
 }
 
 /**
+ * Sentinel returned by `resolveInjectionOwnerConstraint` for a batch that
+ * contains messages from two or more distinct active admins. It matches no
+ * real user id, so the group-queue owner-mismatch guard always defers such a
+ * batch with `no_active` instead of piping it into a live runtime.
+ */
+export const MIXED_ADMIN_BATCH = '__mixed_admin_batch__';
+
+/**
+ * Resolve the owner constraint for ACTIVE-INJECTION of a message batch into a
+ * running `web:main` agent (the `injectOwnerId` passed to
+ * `GroupQueue.sendMessage`).
+ *
+ * Why this exists: the previous latest-sender resolution
+ * (`resolveLatestAdminSenderOverride`) was bypassable by interleave — a batch
+ * `[B_deferred, A_new]` resolved to A, which equals the active run's owner,
+ * so B's message was piped into A's live runtime. That defeats the step-4
+ * guard's stated guarantee that admin B's messages never execute under admin
+ * A's identity (plugins / MCP / user-global memory).
+ *
+ * So instead of "latest wins", this walks the WHOLE batch and collects the
+ * distinct active-admin senders (system senders `happyclaw-agent` /
+ * `__system__` are skipped, consistent with
+ * `resolveLatestAdminSenderOverride`; unknown / inactive / member senders
+ * never count):
+ *   - 0 distinct active admins → `null` (no constraint — e.g. IM open_id
+ *     senders; preserves same-admin IM continuation),
+ *   - exactly 1 → that admin's id (inject only if the live run is theirs),
+ *   - 2 or more → `MIXED_ADMIN_BATCH` — a mixed-admin batch must NEVER be
+ *     piped into one admin's live runtime; it always defers to a fresh
+ *     cold-start where each message expands under its own sender's runtime.
+ */
+export function resolveInjectionOwnerConstraint(
+  messages: ReadonlyArray<RuntimeOwnerCandidateMessage>,
+  getUserById: (id: string) => RuntimeOwnerCandidateUser | null | undefined,
+): string | null {
+  const adminIds = new Set<string>();
+  for (const message of messages) {
+    const sender = message?.sender;
+    if (!sender || sender === 'happyclaw-agent' || sender === '__system__') {
+      continue;
+    }
+    const user = getUserById(sender);
+    if (user?.status === 'active' && user.role === 'admin') {
+      adminIds.add(user.id);
+      if (adminIds.size >= 2) {
+        return MIXED_ADMIN_BATCH;
+      }
+    }
+  }
+  if (adminIds.size === 0) {
+    return null;
+  }
+  return adminIds.values().next().value ?? null;
+}
+
+/**
  * Per-message variant of `resolveAdminSharedRuntimeOwner` (#23 round-15
  * P2-2). On the admin-shared `web:main + is_home` workspace, plugin runtime
  * is per-user — so each message in a mixed-admin batch must expand under
@@ -119,4 +175,33 @@ export function resolvePerMessageRuntimeOwner(args: {
     return user.id;
   }
   return args.fallbackOwner;
+}
+
+/**
+ * Choose the fallback runtime owner for an agent conversation: prefer
+ * `candidateId` (the agent's own `created_by` — auto_im agents stamp the
+ * binding admin) over `fallbackId` (the workspace's `created_by`, i.e. the
+ * bootstrap admin on shared web:main) — but only when `candidateId` is a
+ * distinct *active admin*.
+ *
+ * Why this exists: IM-origin agent conversations carry open_id senders that
+ * `resolveAdminSharedRuntimeOwner`'s sender walk cannot map to a HappyClaw
+ * user, so it returns the fallback. Without this preference that fallback is
+ * the bootstrap admin, and admin B's IM-bound agent would load admin A's
+ * plugins/MCP and write B's memory into A's user-global dir. Pure: the caller
+ * injects the user lookup and gates the web:main check, keeping it unit-testable.
+ */
+export function preferActiveAdminFallback(
+  candidateId: string | null | undefined,
+  fallbackId: string | null | undefined,
+  getUserById: (id: string) => RuntimeOwnerCandidateUser | null | undefined,
+): string | null | undefined {
+  if (!candidateId || candidateId === fallbackId) {
+    return fallbackId;
+  }
+  const user = getUserById(candidateId);
+  if (user?.status === 'active' && user.role === 'admin') {
+    return candidateId;
+  }
+  return fallbackId;
 }

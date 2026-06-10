@@ -618,10 +618,17 @@ async function handleWebUserMessage(
   if (sendResult === 'sent') {
     pipedToActive = true;
   } else {
-    if (eagerExpandActive && sendContent !== content) {
+    if (
+      eagerExpandActive &&
+      sendContent !== content &&
+      !deps.queue.hasActiveMainRunnerForMessage(chatJid)
+    ) {
       // Active runner exited between peek and sendMessage → cold-start will
       // re-expand from the ORIGINAL DB content, so inline `!` runs again.
       // Rare but possible — flagged so we can quantify in production.
+      // Re-check the runner: a #519 owner-mismatch deferral also returns
+      // 'no_active' while the runner is still ALIVE — that is the guard working
+      // as intended, not an exit race, so it must not pollute this telemetry.
       logger.warn(
         {
           event: 'plugin_expander_race',
@@ -762,11 +769,13 @@ async function handleAgentConversationMessage(
   //     `expandMessagesIfNeeded`) would re-expand from the original DB row
   //     → inline double-fire. Cold-start handles all three outcomes.
   let agentSendContent = content;
+  // Parent group row: needed by the eager expander below AND by the #519
+  // injectOwnerId resolution before sendMessage.
+  const parentGroup =
+    deps.getRegisteredGroups()[chatJid] ?? getRegisteredGroup(chatJid);
   const eagerExpandAgentActive =
     deps.queue.hasActiveMainRunnerForMessage(virtualChatJid);
   if (eagerExpandAgentActive) {
-    const parentGroup =
-      deps.getRegisteredGroups()[chatJid] ?? getRegisteredGroup(chatJid);
     if (parentGroup) {
       // Use the effective (sibling-resolved) parent group so a non-home parent
       // bound to a home sibling expands plugins via the home's executionMode /
@@ -876,18 +885,46 @@ async function handleAgentConversationMessage(
 
   // Try to pipe into running agent process
   const agentImages = toAgentImages(normalizedAttachments);
+  // #519 step 4: on the shared web:main home, resolve this message's runtime
+  // owner (the active-admin sender) so the queue's owner-mismatch guard defers
+  // it to a fresh run instead of injecting admin B's message into admin A's
+  // active agent conversation (which would run under A's plugins/MCP and write
+  // B's memory into A's user-global dir). The resolver strips the '#agent:'
+  // suffix internally, so the virtual JID gates on the parent base JID.
+  // Fallback-to-created_by is safe here — unlike IM injection sites — because
+  // the sender is always an authenticated HappyClaw user, and on web:main the
+  // ACL only admits active admins, so the fallback never bites there. Mirrors
+  // the handleWebUserMessage resolution above.
+  const injectOwnerId = parentGroup
+    ? resolvePerMessageRuntimeOwner({
+        chatJid: virtualChatJid,
+        isHome: !!parentGroup.is_home,
+        fallbackOwner: parentGroup.created_by,
+        message: { sender: userId },
+        getUserById,
+      })
+    : undefined;
   const agentSendResult = deps.queue.sendMessage(
     virtualChatJid,
     formatted,
     agentImages,
     undefined,
     virtualChatJid,
+    injectOwnerId,
   );
   if (agentSendResult === 'no_active') {
-    if (eagerExpandAgentActive && agentSendContent !== content) {
+    if (
+      eagerExpandAgentActive &&
+      agentSendContent !== content &&
+      !deps.queue.hasActiveMainRunnerForMessage(virtualChatJid)
+    ) {
       // Race: peek said active, but the runner exited before sendMessage.
       // Cold-start re-expands from the original DB row → inline `!` may
       // run twice. Lead-approved edge case; logged for telemetry.
+      // Re-check the runner: a #519 owner-mismatch deferral also returns
+      // 'no_active' with the runner still ALIVE (the guard deferring to a fresh
+      // cold-start); that is not an exit race and the expansion sentinel was
+      // already persisted, so it must not be logged as one.
       logger.warn(
         {
           event: 'plugin_expander_race',
@@ -903,6 +940,13 @@ async function handleAgentConversationMessage(
     }
     // No running process — force close any stale state and start fresh.
     // Mirrors the reliable IM path in buildOnAgentMessage() (#240).
+    // #519 step 4: 'no_active' also covers an owner mismatch (the guard in
+    // GroupQueue.sendMessage deferred the message because the conversation is
+    // actively running under another admin's runtime). In that case closeStdin
+    // drains the other admin's running conversation and the fresh run below
+    // cold-starts under the sender's runtime — the message is already
+    // persisted above, so nothing is lost; acceptable between mutually-trusted
+    // admins sharing web:main.
     deps.queue.closeStdin(virtualChatJid);
     if (deps.processAgentConversation) {
       const taskId = `agent-conv:${agentId}:${Date.now()}`;

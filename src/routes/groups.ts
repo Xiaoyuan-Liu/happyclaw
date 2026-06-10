@@ -44,6 +44,7 @@ import {
   getGroupMembers,
   getGroupMemberRole,
   getUserById,
+  getUserHomeGroup,
   getAgent,
   listUsers,
   listAgentsByJid,
@@ -210,6 +211,14 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
     return cached;
   }
 
+  // Canonical home resolver (db.getUserHomeGroup): the exact-match home row
+  // (is_home + created_by) wins; the web:main admin fallback applies only when
+  // the user has no row of their own. Deriving is_my_home from it keeps a
+  // single source of truth — e.g. a member promoted to admin keeps a leftover
+  // home-{userId} row, and flagging BOTH it and web:main would break the
+  // frontend home-slot logic (exactly one group may carry the flag).
+  const homeJid = getUserHomeGroup(user.id)?.jid;
+
   for (const [jid, group] of visibleEntries) {
     const isHome = !!group.is_home;
     const isWeb = jid.startsWith('web:');
@@ -236,10 +245,9 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
       // web:main (folder === 'main') is the active-admins-shared admin home
       // (issue #519, option B): every active admin treats it as their home so
       // the sidebar home slot, default selection, and IM-binding panel resolve.
-      is_my_home:
-        ((isHome && group.created_by === user.id) ||
-          canAdminShareMainHome(group, user)) ||
-        undefined,
+      // is_my_home mirrors db.getUserHomeGroup exactly (see homeJid above) so
+      // the shared-home fallback never double-flags alongside an own home row.
+      is_my_home: jid === homeJid || undefined,
       is_shared: isShared || undefined,
       member_role: memberInfo?.role ?? undefined,
       member_count: isShared ? memberInfo?.count : undefined,

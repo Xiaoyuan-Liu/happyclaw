@@ -67,19 +67,55 @@ remains owner-only (`created_by`).
 
 ## Known follow-ups (NOT in this slice)
 
-- **Steps 3–4 — runtime isolation.** Cold-start already resolves the runtime
-  owner per active-admin sender (`src/index.ts processGroupMessages`), so a
-  cold run writes global memory to the correct admin. The remaining gap: when
-  admin A's runner is **already active**, admin B's IPC-injected message
-  executes under admin A's loaded plugin/MCP runtime. This is a correctness
-  issue between mutually-trusted admins (not a privilege escalation), to be
-  closed by threading `runtimeOwnerId` through the runner
-  (`ContainerInput.runtimeOwnerId`) and guarding active-runner owner mismatch
-  in the queue. These touch `src/index.ts` / `src/container-runner.ts` /
-  `src/group-queue.ts` and are sequenced as separate PRs.
-- **Frontend button gating.** A second admin sees the `web:main` rename/reset
-  controls (payload `editable: true`) but the owner-only `canModifyGroup` will
-  return 403 — same frontend-shows / backend-enforces pattern as elsewhere.
+- **Steps 3–4 — runtime isolation: DONE for web senders and IM-bound agents.**
+  `runtimeOwnerId` now threads through the runner
+  (`ContainerInput.runtimeOwnerId` → plugins / MCP / user-global memory),
+  `GroupQueue.sendMessage` guards active-runner owner mismatch via
+  `injectOwnerId` (mismatch defers to a fresh cold-start), and the
+  agent-conversation path (`processAgentConversation` + `buildOnAgentMessage`)
+  resolves and pins the per-run owner the same way the main conversation does —
+  closing the sub-agent gap where admin B's agent conversation ran under the
+  bootstrap admin's plugins/MCP and wrote B's memory into the bootstrap admin's
+  user-global directory. Agent conversations additionally prefer the agent's own
+  `created_by` (auto_im agents stamp the binding admin) as the cold-start
+  fallback, so IM-bound agents isolate even though their senders are open_ids.
+- **IM-origin sender on the MAIN conversation — residual.** Runtime owner
+  resolution is *sender-based*, and only senders that map to a HappyClaw user id
+  (web senders) constrain the runtime. An IM message routed to the shared
+  `web:main` **main** conversation carries an open_id sender that maps to no
+  user, so `resolveInjectionOwnerConstraint` / `resolveAdminSharedRuntimeOwner`
+  treat it as "no constraint" and it injects into / cold-starts under whichever
+  active-admin runtime applies (active runner's owner, or the workspace
+  fallback) rather than the IM sender's own. The owning admin IS derivable
+  (`message.source_jid` → source group `created_by`); wiring that mapping into
+  the resolvers (so IM-origin main-conversation traffic isolates like web and
+  agent traffic) is follow-up. This is pre-existing (carried over from the
+  prior latest-sender resolver), not introduced by this slice.
+- **Mixed-admin batch residual.** When messages from two or more active
+  admins accumulate into one pending batch — the window is the remainder of
+  any active run (up to `containerTimeout`) plus any capacity wait, NOT just
+  one poll cycle — the injection constraint resolves to the
+  `MIXED_ADMIN_BATCH` sentinel (`src/runtime-owner.ts`), so the batch always
+  defers instead of piping into one admin's live runtime. Two caveats: (a) the
+  sentinel only counts *web-identifiable* admins, so a batch mixing one IM
+  (open_id) admin and one web admin resolves to the single web admin (see the
+  IM-origin residual above); (b) the subsequent cold-start pins the WHOLE batch
+  to the latest active-admin sender (`resolveAdminSharedRuntimeOwner`).
+  Per-message runtime within one run is impossible — one process = one mount set
+  (plugins / MCP / memory are fixed at spawn) — so splitting a mixed batch into
+  per-admin cold-starts is the remaining follow-up.
+- **Three-identity decoupling.** `created_by` / `runtimeOwnerId` /
+  `actorUserId` (see the identity split above) are still partially conflated
+  downstream: cold-start rewrites `effectiveGroup.created_by` to carry the
+  runtime owner, so usage attribution and other consumers follow the runtime
+  owner rather than receiving the three identities as explicit, independent
+  parameters. Decoupling them is follow-up work.
+- **Modify vs delete on `web:main`.** `canModifyGroup` now admits any active
+  admin on `web:main` (rename / reset / `/clear` / agent + skill management),
+  symmetric with `canAccessGroup`, so a second admin's controls are backed by the
+  API — not a frontend-shows / backend-403 mismatch. Deletion stays blocked for
+  every `is_home` group (`canDeleteGroup` returns false outright), so the shared
+  home cannot be deleted by anyone.
 - **IM siblings of the main folder.** A personal IM channel (feishu/telegram)
   bound to the `main` folder produces a non-home jid (`is_home=false`). Two
   related gaps follow, both rooted in sibling selection being owner-scoped rather

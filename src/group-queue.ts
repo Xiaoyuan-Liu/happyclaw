@@ -1332,6 +1332,8 @@ export class GroupQueue {
       state.groupFolder = null;
       state.agentId = null;
       state.taskRunId = null;
+      // #519: clear the per-run runtime owner, symmetric with runForGroup's finally.
+      state.runtimeOwnerId = null;
       this.activeCount--;
       if (isHostMode) {
         this.activeHostProcessCount--;
