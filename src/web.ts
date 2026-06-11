@@ -773,21 +773,23 @@ async function handleAgentConversationMessage(
   // injectOwnerId resolution before sendMessage.
   const parentGroup =
     deps.getRegisteredGroups()[chatJid] ?? getRegisteredGroup(chatJid);
+  // Sibling-resolved effective parent: a non-home parent bound to a home sibling
+  // inherits the home's is_home / created_by / executionMode / customCwd. Used by
+  // BOTH the eager expander (#21 round-13 P2-3) AND the #519 injectOwnerId
+  // resolution below, so the owner-mismatch guard gates on the real workspace
+  // (e.g. web:main) rather than the raw binding row — matching the IM twin in
+  // buildOnAgentMessage.
+  const effectiveParent =
+    parentGroup && deps.resolveEffectiveGroup
+      ? deps.resolveEffectiveGroup(parentGroup).effectiveGroup
+      : parentGroup;
   const eagerExpandAgentActive =
     deps.queue.hasActiveMainRunnerForMessage(virtualChatJid);
   if (eagerExpandAgentActive) {
-    if (parentGroup) {
-      // Use the effective (sibling-resolved) parent group so a non-home parent
-      // bound to a home sibling expands plugins via the home's executionMode /
-      // customCwd / created_by — otherwise buildWebExpandContext returns null
-      // for the agent virtual JID and the active runner receives the raw
-      // slash command (#21 round-13 P2-3).
-      const expandParent = deps.resolveEffectiveGroup
-        ? deps.resolveEffectiveGroup(parentGroup).effectiveGroup
-        : parentGroup;
+    if (effectiveParent) {
       const expandCtx = buildWebExpandContext(
         virtualChatJid,
-        expandParent,
+        effectiveParent,
         userId,
       );
       if (expandCtx) {
@@ -895,11 +897,11 @@ async function handleAgentConversationMessage(
   // the sender is always an authenticated HappyClaw user, and on web:main the
   // ACL only admits active admins, so the fallback never bites there. Mirrors
   // the handleWebUserMessage resolution above.
-  const injectOwnerId = parentGroup
+  const injectOwnerId = effectiveParent
     ? resolvePerMessageRuntimeOwner({
         chatJid: virtualChatJid,
-        isHome: !!parentGroup.is_home,
-        fallbackOwner: parentGroup.created_by,
+        isHome: !!effectiveParent.is_home,
+        fallbackOwner: effectiveParent.created_by,
         message: { sender: userId },
         getUserById,
       })
@@ -1833,20 +1835,24 @@ function computeGroupAllowedUserIds(chatJid: string): Set<string> | null {
   // (its created_by is always set), so no folder==='main' special-case is needed.
   if (!ownerId) return null;
 
-  allowed.add(ownerId);
-
-  // For non-home groups, include shared members
-  if (!group.is_home) {
-    const members = getGroupMembers(group.folder);
-    for (const m of members) {
-      allowed.add(m.user_id);
-    }
-  } else if (isMainHome(group)) {
+  if (isMainHome(group)) {
     // web:main is the active-admins-shared admin home (issue #519, option B):
-    // every active admin must receive its broadcasts, not just created_by.
-    // Queried live so a disabled admin stops receiving immediately.
+    // the allow-set IS the live active-admin roster — it already contains
+    // created_by iff that admin is still active. Do NOT add created_by
+    // unconditionally, or a since-disabled/deleted bootstrap admin would linger
+    // in the set (the per-send safeBroadcast status check still catches it, but
+    // the allow-set itself must honor 'disabled admin stops receiving').
     for (const id of getActiveAdminIds()) {
       allowed.add(id);
+    }
+  } else {
+    allowed.add(ownerId);
+    // For non-home groups, include shared members
+    if (!group.is_home) {
+      const members = getGroupMembers(group.folder);
+      for (const m of members) {
+        allowed.add(m.user_id);
+      }
     }
   }
 

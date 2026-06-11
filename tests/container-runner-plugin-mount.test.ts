@@ -366,6 +366,38 @@ describe('per-run MCP server isolation (#519)', () => {
       buildUserMcpEnv('userWithoutServers').HAPPYCLAW_USER_MCP_SERVERS_JSON,
     ).toBe('{}');
   });
+
+  test('docker MCP env rides the 0600 mounted env-dir file, NOT the docker -e argv (#519 review)', () => {
+    // Credential-bearing MCP server env must not land on the `docker run` argv
+    // (visible via ps/docker inspect). It goes into the 0600 env-dir file that is
+    // mounted read-only and sourced by entrypoint.
+    seedUserMcpServers('mcpOwner', {
+      srv: { enabled: true, command: 'c', env: { TOKEN: 'super-secret-token' } },
+    });
+    const grp = fakeGroup('grp-mcp-env', 'bootstrapAdmin'); // is_home:false → docker path
+
+    const mounts = buildVolumeMounts(
+      grp as any,
+      false, // isAdminHome
+      true, // mountUserSkills
+      undefined, // agentId
+      undefined, // ownerHomeFolder
+      undefined, // taskRunId
+      undefined, // resolvedProvider
+      'mcpOwner', // ownerOverride → whose MCP servers ride this run
+    );
+
+    const envFile = path.join(tmpDataDir, 'env', 'grp-mcp-env', 'env');
+    const contents = fs.readFileSync(envFile, 'utf8');
+    expect(contents).toContain('HAPPYCLAW_USER_MCP_SERVERS_JSON=');
+    expect(contents).toContain('super-secret-token'); // the owner's server (incl. token)
+    // …and the env-dir is mounted read-only into the container (off-argv delivery).
+    expect(
+      mounts.some(
+        (m) => m.containerPath === '/workspace/env-dir' && m.readonly === true,
+      ),
+    ).toBe(true);
+  });
 });
 
 describe('prepareHostPlugins — host-mode pre-spawn materialize', () => {

@@ -10,7 +10,7 @@ import type {
   UserSessionWithUser,
 } from './types.js';
 import type { RuntimeOwnerCandidateUser } from './runtime-owner.js';
-import { canAdminShareMainHome, isMainHome } from './main-home-acl.js';
+import { canAdminShareMainHome } from './main-home-acl.js';
 import {
   getJidsByFolder,
   getRegisteredGroup,

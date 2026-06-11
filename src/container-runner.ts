@@ -811,6 +811,13 @@ export function buildVolumeMounts(
   if (sysSettings.subagentModel && sysSettings.subagentModel !== 'inherit') {
     envLines.push(`SUBAGENT_MODEL=${sysSettings.subagentModel}`);
   }
+  // Per-user MCP servers (whose env/headers may carry credentials) ride the
+  // 0600 env-dir file — sourced by entrypoint into the container's process env —
+  // NOT the `docker run -e` argv, which is visible via `ps`/`docker inspect`
+  // (#519 review). agent-runner reads HAPPYCLAW_USER_MCP_SERVERS_JSON env-first.
+  for (const [key, value] of Object.entries(buildUserMcpEnv(ownerId))) {
+    envLines.push(`${key}=${value}`);
+  }
   if (envLines.length > 0) {
     const envFilePath = path.join(envDir, 'env');
     const quotedLines = shellQuoteEnvLines(envLines);
@@ -923,20 +930,15 @@ function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
   tz: string,
-  extraEnv?: Record<string, string>,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
-  // Set timezone so container Node.js processes use local time (Asia/Shanghai)
+  // Set timezone so container Node.js processes use local time (Asia/Shanghai).
+  // NOTE: per-run secrets (Claude creds, per-user MCP server env/headers) are
+  // NEVER passed via `-e` — they would be visible on the `docker run` argv
+  // (`ps aux`) and in `docker inspect`. They ride the 0600 env-dir file mounted
+  // at /workspace/env-dir (sourced by entrypoint) instead. See buildVolumeMounts.
   args.push('-e', `TZ=${tz}`);
-
-  // Per-run env (e.g. per-user MCP servers). Spawned via an arg array, so each
-  // value is passed literally with no shell interpretation.
-  if (extraEnv) {
-    for (const [key, value] of Object.entries(extraEnv)) {
-      args.push('-e', `${key}=${value}`);
-    }
-  }
 
   // Docker: -v with :ro suffix for readonly
   for (const mount of mounts) {
@@ -1013,12 +1015,7 @@ export async function runContainerAgent(
     // Runtime owner for this run (#519): on the shared web:main home this is the
     // message sender, not group.created_by. MCP servers ride it per-run via env.
     const dockerRuntimeOwner = input.runtimeOwnerId ?? group.created_by;
-    const containerArgs = buildContainerArgs(
-      mounts,
-      containerName,
-      TIMEZONE,
-      buildUserMcpEnv(dockerRuntimeOwner),
-    );
+    const containerArgs = buildContainerArgs(mounts, containerName, TIMEZONE);
 
     logger.debug(
       {

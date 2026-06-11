@@ -48,7 +48,7 @@ import {
   getLastGroupSync,
   getRegisteredGroup,
   getUserById,
-  getActiveAdminIds,
+  getActiveAdminCount,
   getMessagesSince,
   getNewMessages,
   getRouterState,
@@ -3173,24 +3173,41 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     cursorCommitted = true;
   };
 
-  if (effectiveGroup.created_by) {
-    const owner = getUserById(effectiveGroup.created_by);
-    // Defense-in-depth: drop messages whose owner is no longer active
-    // (disabled or deleted). See `src/owner-gate.ts` for rationale.
-    const ownerGate = checkOwnerActive(owner);
-    if (!ownerGate.allowed) {
+  // Defense-in-depth owner gate (#519): web:main is shared by every active
+  // admin, so it gates on active-admin presence — NOT the bootstrap created_by,
+  // which may be a since-disabled/deleted admin (gating on it here re-introduced
+  // the exact lockout the message-loop / agent-conv gates were converted to fix,
+  // dropping IM-origin batches whose cold-start owner stayed the disabled
+  // bootstrap). Other groups still gate on their owner's status. Mirrors the
+  // startMessageLoop / processAgentConversation gates. See main-home-acl.ts.
+  {
+    const ownerGate = evaluateOwnerGate(effectiveGroup, {
+      hasActiveAdmin: () => getActiveAdminCount() > 0,
+      checkOwner: (id) => checkOwnerActive(getUserById(id)),
+    });
+    if (ownerGate.drop) {
       commitCursor();
       await setTyping(chatJid, false);
       logger.info(
-        {
-          chatJid,
-          userId: effectiveGroup.created_by,
-          ownerStatus: ownerGate.status,
-        },
-        'Dropping message: group owner is not active',
+        ownerGate.reason === 'inactive_owner'
+          ? {
+              chatJid,
+              userId: effectiveGroup.created_by,
+              ownerStatus: ownerGate.ownerStatus,
+            }
+          : { chatJid },
+        ownerGate.reason === 'inactive_owner'
+          ? 'Dropping message: group owner is not active'
+          : 'Dropping message: no active admin owns shared web:main',
       );
       return true;
     }
+  }
+  // Billing quota check. Only non-home / non-admin owners are metered; web:main's
+  // owner is an admin, so isMainHome groups (which passed the gate above) never
+  // reach here.
+  if (!isMainHome(effectiveGroup) && effectiveGroup.created_by) {
+    const owner = getUserById(effectiveGroup.created_by);
     if (owner && owner.role !== 'admin') {
       const accessResult = checkBillingAccessFresh(
         effectiveGroup.created_by,
@@ -6132,7 +6149,7 @@ async function processAgentConversation(
   // admin out of shared agent conversations); only drop when no active admin
   // remains. Other groups still gate on their owner's status.
   const ownerGate = evaluateOwnerGate(effectiveGroup, {
-    hasActiveAdmin: () => getActiveAdminIds().length > 0,
+    hasActiveAdmin: () => getActiveAdminCount() > 0,
     checkOwner: (id) => checkOwnerActive(getUserById(id)),
   });
   if (ownerGate.drop) {
@@ -7262,7 +7279,7 @@ async function startMessageLoop(): Promise<void> {
           // which may be a since-disabled/deleted admin. Other groups still gate
           // on their owner's status. See main-home-acl.ts / owner-gate.ts.
           const ownerGate = evaluateOwnerGate(group, {
-            hasActiveAdmin: () => getActiveAdminIds().length > 0,
+            hasActiveAdmin: () => getActiveAdminCount() > 0,
             checkOwner: (id) => checkOwnerActive(getUserById(id)),
           });
           if (ownerGate.drop) {
