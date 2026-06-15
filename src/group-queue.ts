@@ -127,6 +127,28 @@ export class GroupQueue {
     return this.groups.get(groupJid)?.retryCount ?? 0;
   }
 
+  /**
+   * 某 workspace folder 上当前活跃 runner 的最大重试轮次（0 = 无重试）。
+   *
+   * retryCount 存在以 chatJid 为键的 GroupState 上，但 IPC send_message 去重只
+   * 知道源 folder（来自 IPC 目录名）。普通 web 群的 chatJid = `web:<uuid>` 与
+   * folder（`flow-...`）互不相等，按 `web:<folder>` / `<folder>` 猜键必然落空，
+   * 只有 admin home 因 folder=`main`、chatJid=`web:main` 巧合命中。这里直接按
+   * 活跃 runner 的 groupFolder 命中真实重试状态，home 与非 home 一致生效。
+   * （重试重放期间 registerProcess 已设好 groupFolder 且 retryCount>0，正是去重
+   * 窗口；groupFolder 仅在活跃 run 内非空——退出时两处 finally 必置 null——故空闲/
+   * 已退出的残留 state 不会误命中。）
+   */
+  getRetryCountByFolder(folder: string): number {
+    let max = 0;
+    for (const state of this.groups.values()) {
+      if (state.groupFolder === folder && state.retryCount > max) {
+        max = state.retryCount;
+      }
+    }
+    return max;
+  }
+
   /** 本轮失败后队列是否还会再次重试（决定错误提示发本轮还是等最终失败）。 */
   willRetryAfterFailure(groupJid: string): boolean {
     if (this.contextOverflowGroups.has(groupJid)) return false;

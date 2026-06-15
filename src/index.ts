@@ -736,8 +736,9 @@ function isRetryDuplicateIpcSend(
   const now = Date.now();
   const exp = recentIpcSends.get(key);
   // 仅在该 group 处于重试重放时，已见过的指纹才视为重复并抑制。
-  const inRetry = queue.getRetryCount(`web:${sourceGroup}`) > 0
-    || queue.getRetryCount(sourceGroup) > 0;
+  // sourceGroup 是 folder（IPC 目录名），retryCount 却以 chatJid 为键，二者只在
+  // admin home 巧合相等，故必须按 folder 域查询活跃 runner 的重试状态。
+  const inRetry = queue.getRetryCountByFolder(sourceGroup) > 0;
   const isDup = !!(exp && exp > now) && inRetry;
   recentIpcSends.set(key, now + IPC_SEND_DEDUP_TTL_MS);
   // 容量控制：Map 迭代为插入序，先进先出淘汰
